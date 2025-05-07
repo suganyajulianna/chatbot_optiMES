@@ -80,7 +80,7 @@ def chatbot_response():
     help_requests = ["help", "assist", "support"]
 
     if any(greet in user_input for greet in greetings):
-        return jsonify({"reply": "👋 Hello! Welcome to Optimus. How can I assist you today?"})
+        return jsonify({"reply": "👋 Hello! Welcome to OptiMES. How can I assist you today?"})
     elif any(thank in user_input for thank in thanks):
         return jsonify({"reply": "😊 You're welcome! If you have any more questions, feel free to ask."})
     elif any(help_word in user_input for help_word in help_requests):
