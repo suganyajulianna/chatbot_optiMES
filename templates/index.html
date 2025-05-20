@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Optimus Chatbot</title>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #fdfcfb, #e2d1c3);
+      margin: 0;
+      padding: 0;
+    }
+
+    #chat-box {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: linear-gradient(135deg, #ffffff, #e0f7fa);
+      padding: 20px;
+      width: 320px;
+      border-radius: 16px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+      z-index: 1000;
+      border: 2px solid #00acc1;
+    }
+
+    #chat-response {
+      max-height: 300px;
+      overflow-y: auto;
+      margin-bottom: 15px;
+      font-size: 14px;
+      color: #37474f;
+    }
+
+    #chat-response p {
+      margin: 8px 0;
+      padding: 6px 10px;
+      border-radius: 8px;
+    }
+
+    #chat-response p strong {
+      color: #00796b;
+    }
+
+    #chat-response p:nth-child(odd) {
+      background-color: #e1f5fe;
+    }
+
+    #chat-response p:nth-child(even) {
+      background-color: #f1f8e9;
+    }
+
+    input[type="text"] {
+      width: 68%;
+      padding: 8px;
+      font-size: 14px;
+      border: 1px solid #b2ebf2;
+      border-radius: 8px;
+      outline: none;
+    }
+
+    button {
+      padding: 8px 10px;
+      font-size: 14px;
+      margin-left: 5px;
+      background: #00bcd4;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.3s ease;
+    }
+
+    button:hover {
+      background: #0097a7;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="chat-box">
+    <!-- Chat output -->
+    <div id="chat-response"></div>
+
+    <!-- Ask a Question -->
+    <div>
+      <input type="text" id="user-input" placeholder="Ask something...">
+      <button onclick="sendQuestion()">Send</button>
+    </div>
+  </div>
+
+  <script>
+    function sendQuestion() {
+      const userInput = document.getElementById("user-input").value;
+      if (!userInput.trim()) return;
+
+      const chatBox = document.getElementById("chat-response");
+      chatBox.innerHTML += `<p><strong>You:</strong> ${userInput}</p>`;
+
+      fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: userInput })
+      })
+        .then(response => response.json())
+        .then(data => {
+          if (Array.isArray(data.reply)) {
+            if (data.reply.length > 0) {
+              chatBox.innerHTML += `<p><strong>Bot:</strong> ${data.reply[0]}</p>`;
+              for (let i = 1; i < data.reply.length; i++) {
+                chatBox.innerHTML += `<p>${data.reply[i]}</p>`;
+              }
+            }
+          } else {
+            chatBox.innerHTML += `<p><strong>Bot:</strong> ${data.reply}</p>`;
+          }
+          document.getElementById("user-input").value = "";
+          chatBox.scrollTop = chatBox.scrollHeight;
+        });
+    }
+
+    // Enable pressing Enter to send
+  document.getElementById("user-input").addEventListener("keydown", function(event) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      sendQuestion();
+    }
+  });
+
+  </script>
+</body>
+
+</html>
