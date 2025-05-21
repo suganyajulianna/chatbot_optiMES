@@ -209,6 +209,18 @@ def chatbot_response():
             "You can ask things like:\n• Show last PPE violation\n• Show latest slip incident\n• Is there any recent safety alert?"
         ]})
 
+    if "hazard" in user_input or any(word in user_input for word in ["fire", "smoke", "gas", "leak", "warning", "alarm"]):
+        return jsonify({"reply": [
+            "🔥 To check hazard warnings, please explore the **Hazard Warning** module.",
+            "You can ask things like:\n• Show last fire alert\n• Was there any gas leak?\n• Latest smoke detection alert?"
+        ]})
+
+    if "compliance" in user_input or any(word in user_input for word in ["unauthorized", "unauthorised", "entry", "occupancy", "vacancy", "policy", "rules"]):
+        return jsonify({"reply": [
+            "📋 To check compliance policies, please refer to the **Compliance Policy** module.",
+            "You can ask things like:\n• Show last unauthorized entry\n• what was the alert on occupancy\n• Is there any trespassern today?"
+        ]})
+
     if contains_term(user_input, ["last alert", "last violation", "last incident", "latest alert", "recent incident"]):
         collections_to_check = infer_collections_from_input(user_input)
         latest_results = get_latest_from_collections(collections_to_check, user_input)
