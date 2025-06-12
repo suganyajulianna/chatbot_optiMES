@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient, DESCENDING
 from bson.objectid import ObjectId
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta , timezone
 from flask_cors import CORS
 import os
 import re
@@ -10,7 +10,7 @@ app = Flask(__name__)
 CORS(app)
 
 # MongoDB Connection
-MONGO_URI = "mongodb+srv://adventistech2025:Adventistech25@cmms.f1xpt.mongodb.net/Merge"
+MONGO_URI = "mongodb+srv://srmrmpparthiban:20a8yW18xd48XYJ9@cluster0.vviu6.mongodb.net/optimus"
 client = MongoClient(MONGO_URI)
 db = client["optimus"]
 
@@ -33,7 +33,9 @@ EMOJI_MAP = {
 
 EXCLUDED_FIELDS = {
     "image", "createdAt", "updatedAt", "compliance frame", "vacant frame",
-    "compliance_frame", "vacant_frame", "Frame", "frame", "createdat", "updatedat"
+    "compliance_frame", "vacant_frame", "Frame", "frame", "createdat", "updatedat","Image","CameraLocationID",
+    "seconds","hours","minutes"
+
 }
 
 ABOUT_APP_TERMS = [
@@ -63,6 +65,12 @@ def contains_term(text, terms):
 def make_naive(dt):
     return dt.replace(tzinfo=None) if dt and dt.tzinfo else dt
 
+def is_latest_incident_query(user_input):
+    keywords = ["latest", "last", "recent", "most recent", "newest"]
+    incident_terms = ["incident", "violation", "alert", "issue", "event"]
+    return any(k in user_input.lower() for k in keywords) and \
+           any(t in user_input.lower() for t in incident_terms)
+
 def get_valid_timestamp(record):
     ts = (
         record.get("timestamp") or
@@ -74,20 +82,22 @@ def get_valid_timestamp(record):
 
 def infer_collections_from_input(user_input):
     input_lower = user_input.lower()
+    matched = []
+
     if "fire" in input_lower or "smoke" in input_lower:
-        return ["fires"]
-    elif "gas" in input_lower or "leak" in input_lower:
-        return ["gasleakages"]
-    elif "ppe" in input_lower or "helmet" in input_lower or "vest" in input_lower:
-        return ["ppekits"]
-    elif "slip" in input_lower or "fall" in input_lower:
-        return ["slips"]
-    elif "occupancy" in input_lower or "vacancy" in input_lower:
-        return ["occupancies"]
-    elif any(term in input_lower for term in ["unauthorized", "unauthorised", "authorized", "authorised", "intruder"]):
-        return ["unauthorizedentries"]
-    else:
-        return ALL_COLLECTIONS
+        matched.append("fires")
+    if "gas" in input_lower or "leak" in input_lower:
+        matched.append("gasleakages")
+    if "ppe" in input_lower or "helmet" in input_lower or "vest" in input_lower:
+        matched.append("ppekits")
+    if "slip" in input_lower or "fall" in input_lower:
+        matched.append("slips")
+    if "occupancy" in input_lower or "vacancy" in input_lower:
+        matched.append("occupancies")
+    if any(term in input_lower for term in ["unauthorized", "unauthorised", "authorized", "authorised", "intruder"]):
+        matched.append("unauthorizedentries")
+
+    return matched if matched else []
 
 def get_violations_by_employee(emp_id):
     results = []
@@ -123,38 +133,32 @@ def get_employee_details(emp_id):
 
 def get_latest_from_collections(collection_names, user_input=None):
     latest_results = {}
+
     for col_name in collection_names:
         collection = db[col_name]
-        filter_query = {}
 
+        filter_query = {}
         if col_name == "unauthorizedentries" and user_input:
-            unauth_terms = ["unauthorized", "trespass", "intruder", "unidentified", "stranger", "not authorized", "unknown"]
+            unauth_terms = ["unauthorized", "trespass", "intruder", "unidentified", "trespasser", "trespassing", "entered illegally", "someone not allowed", "intrusion", "not authorized", "unknown person", "out of work", "stranger", "trespassed"]
             auth_terms = ["authorized", "permitted", "allowed"]
-            if any(term in user_input for term in unauth_terms):
+            if any(re.search(rf"\b{term}\b", user_input) for term in unauth_terms):
                 filter_query = {"scenario": {"$regex": r"(unauthorized|trespass|intruder|unidentified|stranger|not authorized|unknown)", "$options": "i"}}
-            elif any(term in user_input for term in auth_terms):
+            elif any(re.search(rf"\b{term}\b", user_input) for term in auth_terms):
                 filter_query = {"scenario": {"$regex": r"(authorized|permitted|allowed)", "$options": "i"}}
             else:
+                # If no strong keyword match, avoid defaulting to unfiltered (which may return authorized entries)
                 filter_query = {"scenario": {"$not": {"$regex": r"^authorized entry$", "$options": "i"}}}
+               
 
-        if is_today_incident_query(user_input):
-            today = datetime.now().date()
-            start_of_day = datetime.combine(today, datetime.min.time())
-            end_of_day = datetime.combine(today, datetime.max.time())
-            filter_query["$or"] = [
-                {"timestamp": {"$gte": start_of_day, "$lte": end_of_day}},
-                {"start_timestamp": {"$gte": start_of_day, "$lte": end_of_day}},
-                {"createdAt": {"$gte": start_of_day, "$lte": end_of_day}},
-                {"_id": {"$gte": ObjectId.from_datetime(start_of_day)}}
+        doc = collection.find_one(
+            filter_query,
+            sort=[
+                ("timestamp", DESCENDING),
+                ("start_timestamp", DESCENDING),
+                ("createdAt", DESCENDING),
+                ("_id", DESCENDING)
             ]
-        
-
-        doc = collection.find_one(filter_query, sort=[
-            ("timestamp", DESCENDING),
-            ("start_timestamp", DESCENDING),
-            ("createdAt", DESCENDING),
-            ("_id", DESCENDING)
-        ])
+        )
 
         latest_data = None
         if not doc:
@@ -166,13 +170,17 @@ def get_latest_from_collections(collection_names, user_input=None):
                 try:
                     latest_nested = max(
                         value,
-                        key=lambda x: get_valid_timestamp(x)
+                        key=lambda x: x.get("timestamp") or
+                                      x.get("start_timestamp") or
+                                      x.get("createdAt") or
+                                      (x.get("_id").generation_time if isinstance(x.get("_id"), ObjectId) else datetime.min)
                     )
                     latest_data = latest_nested
                 except Exception:
                     latest_data = value[0]
 
-        latest_results[col_name] = (latest_data if latest_data else doc, col_name)
+        latest_results[col_name] = (doc, latest_data if latest_data else None, col_name)
+
     return latest_results
 
 @app.route('/')
@@ -183,62 +191,7 @@ def home():
 def chatbot_response():
     user_input = request.json.get("message", "").lower()
 
-    if is_about_app(user_input):
-        return jsonify({"reply": [
-            "🛡️ **OptiMES – Safety Management System**",
-            "It ensures industrial safety, compliance, and awareness across:",
-            "1️⃣ Hazard Warnings – Fire, smoke, gas leak incidents.",
-            "2️⃣ Worker Health & Safety – Slips, PPE violations, worker safety.",
-            "3️⃣ Compliance Policies – Occupancy control, unauthorized entry.",
-            "💡 You can ask me about recent alerts, employee details, policy breaches, and more."
-        ]})
-    
-
-    if any(greet in user_input for greet in ["hi", "hello", "hey"]):
-        return jsonify({"reply": "👋 Hello! How can I help you with safety insights today?"})
-
-    if any(word in user_input for word in ["thank you", "thanks"]):
-        return jsonify({"reply": "😊 You're welcome!"})
-
-    if any(word in user_input for word in ["help", "assist", "support"]):
-        return jsonify({"reply": "🆘 Try asking: 'last alert', 'employee violations', or 'details of employee ADV001'"})
-    
-    if "worker" in user_input and any(word in user_input for word in ["safe", "safety", "status", "okay", "fine", "health", "injury", "accident"]):
-        return jsonify({"reply": [
-            "🛡️ To know about worker health and safety status, I recommend checking the **Worker Health & Safety** module.",
-            "You can ask things like:\n• Show last PPE violation\n• Show latest slip incident\n• Is there any recent safety alert?"
-        ]})
-
-    if "hazard" in user_input or any(word in user_input for word in ["fire", "smoke", "gas", "leak", "warning", "alarm"]):
-        return jsonify({"reply": [
-            "🔥 To check hazard warnings, please explore the **Hazard Warning** module.",
-            "You can ask things like:\n• Show last fire alert\n• Was there any gas leak?\n• Latest smoke detection alert?"
-        ]})
-
-    if "compliance" in user_input or any(word in user_input for word in ["unauthorized", "unauthorised", "entry", "occupancy", "vacancy", "policy", "rules"]):
-        return jsonify({"reply": [
-            "📋 To check compliance policies, please refer to the **Compliance Policy** module.",
-            "You can ask things like:\n• Show last unauthorized entry\n• what was the alert on occupancy\n• Is there any trespassern today?"
-        ]})
-
-    if contains_term(user_input, ["last alert", "last violation", "last incident", "latest alert", "recent incident"]):
-        collections_to_check = infer_collections_from_input(user_input)
-        latest_results = get_latest_from_collections(collections_to_check, user_input)
-        responses = []
-
-        for record, col_name in latest_results.values():
-            if record:
-                response_lines = [f"⚠️ **Latest Alert from `{col_name}`**:"]
-                for key, value in record.items():
-                    if key in EXCLUDED_FIELDS or isinstance(value, (dict, list)):
-                        continue
-                    emoji = EMOJI_MAP.get(key, "🔹")
-                    response_lines.append(f"{emoji} **{key}**: {value}")
-                responses.append("\n".join(response_lines))
-
-        return jsonify({"reply": responses if responses else ["No alerts found."]})
-
-    # Case 2: Cumulative employee violations
+    # Case 1: Cumulative employee violations
     emp_match = re.search(r"(adv\d+)", user_input)
     if emp_match and any(word in user_input for word in ["violation", "alert", "incident", "ppe", "slip", "record"]):
         emp_id = emp_match.group(1).upper()
@@ -251,8 +204,8 @@ def chatbot_response():
             details = ", ".join([f"{k}: {v[k]}" for k in v if k not in EXCLUDED_FIELDS and not isinstance(v[k], (dict, list))])
             response.append(f"🔸 {ts} | Source: {v['source']} | {details}")
         return jsonify({"reply": response})
-
-    # Case 3: Direct employee info
+    
+    # Case 2: Direct employee info
     emp_id_match = re.search(r'\badv\d{3}\b', user_input)
     if emp_id_match:
         emp_id = emp_id_match.group().upper()
@@ -270,52 +223,8 @@ def chatbot_response():
             return jsonify({"reply": response.strip().split("\n")})
         else:
             return jsonify({"reply": f"❌ No employee found with ID {emp_id}."})
-
-    
-    # Case 4: Fetch all employees linked to PPE Kits
-    if contains_term(user_input, ["ppe", "ppe violation", "ppe kit", "compliance", "person"]):
-        results = db.ppekits.aggregate([
-            {
-                "$lookup": {
-                    "from": "employeedatas",
-                    "localField": "personName",
-                    "foreignField": "_id",
-                    "as": "employee"
-                }
-            },
-            {"$unwind": "$employee"},
-            {
-                "$project": {
-                    "_id": 0,
-                    "name": "$employee.Name",
-                    "email": "$employee.EmailID",
-                    "designation": "$employee.Designation",
-                    "department": "$employee.Department",
-                    "location": "$employee.Location",
-                    "mobile": "$employee.Mobilenumber"
-                }
-            }
-        ])
-        employees = list(results)
-
-        if not employees:
-            return jsonify({"reply": "❌ No employee data found linked to PPE kits."})
-
-        response = "🧑‍🏭 **PPE Kit Compliance - Employee Details:**\n\n"
-        for emp in employees:
-            response += (
-                f"👤 Name: **{emp['name']}**\n"
-                f"📧 Email: {emp['email']}\n"
-                f"📞 Mobile: {emp['mobile']}\n"
-                f"🏢 Dept: {emp['department']}\n"
-                f"💼 Designation: {emp['designation']}\n"
-                f"📍 Location: {emp['location']}\n\n"
-            )
-        return jsonify({"reply": response.strip().split("\n")})
-
-    # return jsonify({"reply": "🤔 I'm not sure how to help with that. Please rephrase your query."})
-
-
+        
+    # case 3 : 
     unauth_terms = ["unauthorized", "trespass", "intruder", "unidentified", "trespasser",
                     "trespassing", "entered illegally", "someone not allowed", "intrusion",
                     "not authorized", "unknown person", "out of work", "stranger", "trespassed"]
@@ -323,7 +232,7 @@ def chatbot_response():
 
     if any(re.search(rf"\b{re.escape(term)}\b", user_input) for term in unauth_terms + auth_terms):
         result = get_latest_from_collections(["unauthorizedentries"], user_input=user_input)
-        doc, _ = result.get("unauthorizedentries", (None, None))
+        doc, _ , _= result.get("unauthorizedentries", (None, None,None))
         if not doc:
             return jsonify({"reply": "✅ No matching unauthorized or authorized entries found yet."})
         ts = doc.get("timestamp") or doc.get("start_timestamp") or doc.get("createdAt") or (doc.get("_id").generation_time if isinstance(doc.get("_id"), ObjectId) else "N/A")
@@ -417,48 +326,91 @@ def chatbot_response():
                 response_lines.append(f"• **{module}** reported something at 🕒 **{ts}**")
             return jsonify({"reply": response_lines})
         else:
-            return jsonify({"reply": "✅ No alerts, incidents, or violations reported today."})
+            return jsonify({"reply": "✅ No alerts, incidents, or violations reported today."})    
 
-    # --- Step 3: General Latest Alert (Fallback) ---
-    if "fire" in user_input or "smoke" in user_input or "fire extinguisher" in user_input:
-        collections = ["fires"]
-    elif "gas" in user_input:
-        collections = ["gasleakages"]
-    elif "slip" in user_input:
-        collections = ["slips"]
-    elif "health" in user_input or "safety" in user_input:
-        collections = ["slips", "ppekits"]
-    elif any(term in user_input for term in ["compliance exceedance", "occupancy", "vacancy"]):
-        collections = ["occupancies"]
-    elif any(term in user_input for term in ["trespass", "trespasser", "unauthorized", "intruder", "unidentified person"]):
-        collections = ["unauthorizedentries"]
-    elif "compliance" in user_input or "policies" in user_input:
-        collections = ["occupancies", "unauthorizedentries"]
-    else:
-        collections = ALL_COLLECTIONS
+    if is_about_app(user_input):
+        return jsonify({"reply": [
+            "🛡️ **OptiMES – Safety Management System**",
+            "It ensures industrial safety, compliance, and awareness across:",
+            "1️⃣ Hazard Warnings – Fire, smoke, gas leak incidents.",
+            "2️⃣ Worker Health & Safety – Slips, PPE violations, worker safety.",
+            "3️⃣ Compliance Policies – Occupancy control, unauthorized entry.",
+            "💡 You can ask me about recent alerts, employee details, policy breaches, and more."
+        ]})
+    
+
+    if any(greet in user_input for greet in ["hi", "hello", "hey"]):
+        return jsonify({"reply": "👋 Hello! How can I help you with safety insights today?"})
+
+    if any(word in user_input for word in ["thank you", "thanks"]):
+        return jsonify({"reply": "😊 You're welcome!"})
+
+    if any(word in user_input for word in ["help", "assist", "support"]):
+        return jsonify({"reply": "🆘 Try asking: 'last alert', 'employee violations', or 'details of employee ADV001'"})
+    
+    
+     # Try to infer collections first
+    collections = infer_collections_from_input(user_input)
+    # Fallback: use SCENARIO_COLLECTION_MAP if user refers to a module (like "hazard warnings")
+    if not collections:
+        for scenario, cols in SCENARIO_COLLECTION_MAP.items():
+            if scenario.rstrip("s") in user_input or scenario in user_input:
+                collections = cols
+                break
+
+    # Still nothing? Try keyword-based logic
+    if not collections:
+        if "fire" in user_input or "smoke" in user_input or "fire extinguisher" in user_input:
+            collections = ["fires"]
+        elif "gas" in user_input:
+            collections = ["gasleakages"]
+        elif "slip" in user_input:
+            collections = ["slips"]
+        elif "health" in user_input or "safety" in user_input:
+            collections = ["slips", "ppekits"]
+        elif any(term in user_input for term in ["compliance exceedance", "occupancy", "vacancy"]):
+            collections = ["occupancies"]
+        elif any(term in user_input for term in ["trespass", "trespasser", "unauthorized", "intruder", "unidentified person"]):
+            collections = ["unauthorizedentries"]
+        elif "compliance" in user_input or "policies" in user_input:
+            collections = ["occupancies", "unauthorizedentries"]
+
+    # As a last resort, if nothing matched
+    if not collections:
+        return jsonify({"reply": [
+            "⚠️ Sorry, I couldn't determine which module to check.",
+            "Try asking about alerts related to fire, gas, occupancy, trespass, PPE, or slips."
+        ]})
 
     latest_docs = get_latest_from_collections(collections, user_input=user_input)
 
     latest_doc = None
-    latest_time = datetime.min
+    latest_time = datetime.min.replace(tzinfo=timezone.utc)
     latest_collection = None
-
-    for doc, col_name in latest_docs.values():
-        if doc:
+    
+    #for doc, col_name in latest_docs.values():
+    for parent_doc, frame_doc, col_name in latest_docs.values():
+        if parent_doc:
             doc_time = (
-                doc.get("timestamp") or
-                doc.get("start_timestamp") or
-                doc.get("createdAt") or
-                (doc["_id"].generation_time if isinstance(doc.get("_id"), ObjectId) else None)
+                parent_doc.get("timestamp") or
+                parent_doc.get("start_timestamp") or
+                parent_doc.get("createdAt") or
+                (parent_doc["_id"].generation_time if isinstance(parent_doc.get("_id"), ObjectId) else None)
             )
-            if doc_time and doc_time > latest_time:
-                latest_time = doc_time
-                latest_doc = doc
-                latest_collection = col_name
-
+            # Normalize datetime before comparison
+            if doc_time:
+                if doc_time.tzinfo is None:
+                    doc_time = doc_time.replace(tzinfo=timezone.utc)
+                if doc_time > latest_time:
+                    latest_time = doc_time
+                    latest_doc = parent_doc
+                    latest_collection = col_name
+                    
+    # If still nothing found in collections
     if not latest_doc:
-        return jsonify({"reply": "⚠️ No recent data found in the system."})
+        return jsonify({"reply": [f"✅ No recent alerts found in: {', '.join(collections)}."]})
 
+    # Extract timestamp and module info
     _id = latest_doc.get("_id")
     timestamp = (
         latest_doc.get("timestamp") or
@@ -469,22 +421,65 @@ def chatbot_response():
     timestamp = str(timestamp)
     module = latest_doc.get("scenario") or latest_doc.get("module") or (latest_collection.replace("_", " ").title() if latest_collection else "Unknown Module")
 
-    summary_lines = [f"📢 Last Alert Summary from **{module}** at 🕒 **{timestamp}**:\n"]
+    summary_lines = [f"📢 Last Alert Summary from {module} at 🕒 **{timestamp}**:\n"]
+    print("📄 Entire latest_doc:", latest_doc)
+    
+    # 1️⃣ First check if 'location ID' is at the root of the latest document
+    location_id = None
+    for key in ["locationID", "location_id", "locationId", "location ID"]:
+        if key in parent_doc:
+            location_id = parent_doc[key]
+            print(f"✅ Found location in parent: {key} = {location_id}")
+            break
+    # 2️⃣ If not found, check in selected frame (if available)
+    if not location_id and frame_doc:
+        for key in ["locationID", "location_id", "locationId", "location ID"]:
+            if key in frame_doc:
+                location_id = frame_doc[key]
+                print(f"✅ Found location ID in frame: {key} = {location_id}")
+                break
 
-    for key, value in latest_doc.items():
-        if key.lower() in EXCLUDED_FIELDS or key.startswith("_"):
-            continue
-        if isinstance(value, dict):
-            for subkey, subval in value.items():
-                emoji = EMOJI_MAP.get(subkey.lower(), "🔸")
-                summary_lines.append(f"{emoji} {subkey.replace('_', ' ').title()}: **{subval}**")
-        else:
+    # 3️⃣ Optional fallback: match any key with both 'location' and 'id'
+    if not location_id:
+        for k, v in parent_doc.items():
+            if "location" in k.lower() and "id" in k.lower():
+                location_id = v
+                print(f"✅ Fallback location ID match: {location_id}")
+                break
+    
+    # Insert Location ID if found
+    if location_id:
+        summary_lines.append(f"🔹 Location ID: **{location_id}**")
+    else:
+        print("❌ Location ID not found in any source")
+
+    # Show latest frame info (if present)
+    if frame_doc:
+        for key, value in frame_doc.items():
+            if key.startswith("_") or key.lower() in EXCLUDED_FIELDS:
+                continue
             emoji = EMOJI_MAP.get(key.lower(), "🔸")
             summary_lines.append(f"{emoji} {key.replace('_', ' ').title()}: **{value}**")
+    else:
+        # Fallback: loop through top-level fields (only if no frame)
+        for key, value in latest_doc.items():
+            if key in ["locationID", "location_id", "locationId", "location ID"]:
+                # already added
+                continue
+            if (latest_collection == "ppekits" and key.lower() == "statuschanges") or \
+                (key.lower() in EXCLUDED_FIELDS and key.lower() != "statuschanges") or \
+                    key.startswith("_"):
+                continue
+            
+            if isinstance(value, dict):
+                for subkey, subval in value.items():
+                    emoji = EMOJI_MAP.get(subkey.lower(), "🔸")
+                    summary_lines.append(f"{emoji} {subkey.replace('_', ' ').title()}: **{subval}**")
+            else:
+                emoji = EMOJI_MAP.get(key.lower(), "🔸")
+                summary_lines.append(f"{emoji} {key.replace('_', ' ').title()}: **{value}**")
 
     return jsonify({"reply": summary_lines})
-
-
-
+  
 if __name__ == '__main__':
     app.run(debug=False, host="0.0.0.0", port=5001)
