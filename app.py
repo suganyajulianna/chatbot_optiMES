@@ -12,7 +12,7 @@ CORS(app)
 # MongoDB Connection
 MONGO_URI = "mongodb+srv://adventistech2025:XOGhPBZxi0gDSPNO@cluster0.awnrusw.mongodb.net/OptiMES40"
 client = MongoClient(MONGO_URI)
-db = client["optimus"]
+db = client["OptiMES40"]
 
 # Scenario → Collections Map
 SCENARIO_COLLECTION_MAP = {
