@@ -13,9 +13,7 @@ CORS(app)
 # MONGO_URI = "mongodb+srv://srmrmpparthiban:20a8yW18xd48XYJ9@cluster0.vviu6.mongodb.net/optimus"
 MONGO_URI = "mongodb+srv://adventistech2025:XOGhPBZxi0gDSPNO@cluster0.awnrusw.mongodb.net/OptiMES40"
 client = MongoClient(MONGO_URI)
-# db = client["optimus"]
 db = client["OptiMES40"]
-
 
 # Scenario → Collections Map
 SCENARIO_COLLECTION_MAP = {
@@ -54,7 +52,7 @@ def is_today_incident_query(user_input):
         "incident today", "fire today", "smoke today"
     ])
 
-
+print(f"📚 All collections in DB: {db.list_collection_names()}")
 def is_about_app(user_input):
     return any(term in user_input for term in ABOUT_APP_TERMS) or \
            re.search(r"\b(what|who|tell|explain|describe).*(this|optimes|app|application|system)\b", user_input)
@@ -76,8 +74,8 @@ def is_latest_incident_query(user_input):
 
 def get_valid_timestamp(record):
     ts = (
-        record.get("timestamp") or
-        record.get("start_timestamp") or
+        record.get("timestamp_alert_start") or
+        record.get("timestamp_alert_end") or
         record.get("createdAt") or
         (record.get("_id").generation_time if isinstance(record.get("_id"), ObjectId) else datetime.min)
     )
@@ -149,42 +147,63 @@ def get_latest_from_collections(collection_names, user_input=None):
             elif any(re.search(rf"\b{term}\b", user_input) for term in auth_terms):
                 filter_query = {"scenario": {"$regex": r"(authorized|permitted|allowed)", "$options": "i"}}
             else:
-                # If no strong keyword match, avoid defaulting to unfiltered (which may return authorized entries)
                 filter_query = {"scenario": {"$not": {"$regex": r"^authorized entry$", "$options": "i"}}}
-               
 
+        # ✅ DEBUG LOGS
+        print(f"\n🔍 Searching in collection: '{col_name}'")
+        print(f"📊 Total documents: {collection.count_documents({})}")
+        print(f"🔎 Filter query: {filter_query}")
+        try:
+            print(f"🧮 Matching docs: {collection.count_documents(filter_query)}")
+        except Exception as e:
+            print(f"⚠️ Error counting filtered docs in '{col_name}': {e}")
+
+        # 🛠️ TEMP: override filter_query if needed to test
+        # if col_name == "ppekits":
+        #     print("⚠️ Overriding filter_query for debugging")
+        #     filter_query = {}
+
+        # 🔽 Try fetching latest document by timestamp/etc
         doc = collection.find_one(
             filter_query,
             sort=[
-                ("timestamp", DESCENDING),
-                ("start_timestamp", DESCENDING),
                 ("createdAt", DESCENDING),
+                ("timestamp_alert_start", DESCENDING),
+                
                 ("_id", DESCENDING)
             ]
         )
 
-        latest_data = None
         if not doc:
-            latest_results[col_name] = (None, col_name)
+            print(f"❌ No document found in '{col_name}' with given filter.")
+            latest_results[col_name] = (None, None, col_name)
             continue
 
+        print(f"✅ Found document in '{col_name}': _id = {doc.get('_id')}")
+
+        # Look for a list of frames inside document
+        frame_doc = None
         for key, value in doc.items():
             if isinstance(value, list) and value and isinstance(value[0], dict):
                 try:
-                    latest_nested = max(
+                    frame_doc = max(
                         value,
                         key=lambda x: x.get("timestamp") or
                                       x.get("start_timestamp") or
                                       x.get("createdAt") or
                                       (x.get("_id").generation_time if isinstance(x.get("_id"), ObjectId) else datetime.min)
                     )
-                    latest_data = latest_nested
-                except Exception:
-                    latest_data = value[0]
+                    print(f"🧩 Selected latest frame from '{key}'")
+                except Exception as e:
+                    print(f"⚠️ Error parsing frames in '{col_name}': {e}")
+                    frame_doc = value[0]
 
-        latest_results[col_name] = (doc, latest_data if latest_data else None, col_name)
+        # Always return parent_doc, frame_doc, collection name
+        latest_results[col_name] = (doc, frame_doc, col_name)
 
     return latest_results
+
+
 
 @app.route('/')
 def home():
@@ -267,14 +286,12 @@ def chatbot_response():
             collection = db[col]
             query = {
                 "$or": [
-                    {"timestamp": {"$gte": datetime.combine(today, datetime.min.time())}},
-                    {"start_timestamp": {"$gte": datetime.combine(today, datetime.min.time())}},
+                    {"timestamp_alert_start": {"$gte": datetime.combine(today, datetime.min.time())}},
                     {"createdAt": {"$gte": datetime.combine(today, datetime.min.time())}}
                 ]
             }
             record = collection.find_one(query, sort=[
-                ("timestamp", DESCENDING),
-                ("start_timestamp", DESCENDING),
+                ("timestamp_alert_start", DESCENDING),
                 ("createdAt", DESCENDING),
                 ("_id", DESCENDING)
             ])
@@ -364,7 +381,7 @@ def chatbot_response():
     # Still nothing? Try keyword-based logic
     if not collections:
         if "fire" in user_input or "smoke" in user_input or "fire extinguisher" in user_input:
-            collections = ["fires"]
+             collections = ["fires"]
         elif "gas" in user_input:
             collections = ["gasleakages"]
         elif "slip" in user_input:
@@ -380,10 +397,12 @@ def chatbot_response():
 
     # As a last resort, if nothing matched
     if not collections:
-        return jsonify({"reply": [
-            "⚠️ Sorry, I couldn't determine which module to check.",
-            "Try asking about alerts related to fire, gas, occupancy, trespass, PPE, or slips."
-        ]})
+        # return jsonify({"reply": [
+        #     "⚠️ Sorry, I couldn't determine which module to check.",
+        #     "Try asking about alerts related to fire, gas, occupancy, trespass, PPE, or slips."
+        # ]})
+        print("⚠️ No specific module inferred. Falling back to ALL collections.")
+        collections = ALL_COLLECTIONS
 
     latest_docs = get_latest_from_collections(collections, user_input=user_input)
 
@@ -400,6 +419,11 @@ def chatbot_response():
                 parent_doc.get("createdAt") or
                 (parent_doc["_id"].generation_time if isinstance(parent_doc.get("_id"), ObjectId) else None)
             )
+            print(f"🧪 Checking document in collection: '{col_name}' with doc_time: {doc_time}")
+        
+            if not doc_time:
+                _id = parent_doc.get("_id", "unknown")
+                print(f"⚠️ No timestamp info found in document from '{col_name}' with _id: {_id}")
             # Normalize datetime before comparison
             if doc_time:
                 if doc_time.tzinfo is None:
@@ -429,11 +453,12 @@ def chatbot_response():
     
     # 1️⃣ First check if 'location ID' is at the root of the latest document
     location_id = None
-    for key in ["locationID", "location_id", "locationId", "location ID"]:
-        if key in parent_doc:
-            location_id = parent_doc[key]
-            print(f"✅ Found location in parent: {key} = {location_id}")
-            break
+    if parent_doc:
+        for key in ["locationID", "location_id", "locationId", "location ID"]:
+            if key in parent_doc:
+                location_id = parent_doc[key]
+                print(f"✅ Found location in parent: {key} = {location_id}")
+                break
     # 2️⃣ If not found, check in selected frame (if available)
     if not location_id and frame_doc:
         for key in ["locationID", "location_id", "locationId", "location ID"]:
@@ -443,7 +468,7 @@ def chatbot_response():
                 break
 
     # 3️⃣ Optional fallback: match any key with both 'location' and 'id'
-    if not location_id:
+    if not location_id and parent_doc:
         for k, v in parent_doc.items():
             if "location" in k.lower() and "id" in k.lower():
                 location_id = v
