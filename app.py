@@ -14,6 +14,7 @@ CORS(app)
 MONGO_URI = "mongodb+srv://adventistech2025:XOGhPBZxi0gDSPNO@cluster0.awnrusw.mongodb.net/OptiMES40"
 client = MongoClient(MONGO_URI)
 db = client["OptiMES40"]
+permit_collection = db["permits"]
 
 # Scenario → Collections Map
 SCENARIO_COLLECTION_MAP = {
@@ -100,37 +101,41 @@ def infer_collections_from_input(user_input):
 
     return matched if matched else []
 
-def get_violations_by_employee(emp_id):
+def get_violations_by_employee(person_id):
+    """
+    Fetch all violations/alerts for a person (employee or visitor)
+    across all collections, using personId.
+    """
     results = []
+
     for col_name in ALL_COLLECTIONS:
         collection = db[col_name]
-        if col_name == "ppekits":
-            pipeline = [
-                {
-                    "$lookup": {
-                        "from": "employeedatas",
-                        "localField": "personName",
-                        "foreignField": "_id",
-                        "as": "employee_info"
-                    }
-                },
-                {"$unwind": "$employee_info"},
-                {"$match": {"employee_info.employee_id": emp_id}}
+
+        # Query matches either 'employee_id' or 'personName' with the given person_id
+        query = {
+            "$or": [
+                {"employee_id": person_id},
+                {"personName": person_id}
             ]
-            matches = list(collection.aggregate(pipeline))
-        else:
-            matches = list(collection.find({"employee_id": emp_id}))
+        }
+
+        matches = list(collection.find(query))
 
         for doc in matches:
             doc["source"] = col_name
             doc["timestamp"] = get_valid_timestamp(doc)
             results.append(doc)
 
+    # Sort results by timestamp descending
     results.sort(key=lambda x: x.get("timestamp", datetime.min), reverse=True)
     return results
 
-def get_employee_details(emp_id):
-    return db["employeedatas"].find_one({"employee_id": emp_id})
+
+def get_person_details(person_id):
+    person_id = person_id.strip().upper()  # normalize
+    person = db["persons"].find_one({"personId": person_id})
+    print(f"🔍 Looking for {person_id}, Found:", person)
+    return person
 
 def get_latest_from_collections(collection_names, user_input=None):
     latest_results = {}
@@ -203,7 +208,22 @@ def get_latest_from_collections(collection_names, user_input=None):
 
     return latest_results
 
+def get_permit_by_number(permit_number):
+    return permit_collection.find_one({"permitNumber": permit_number})
 
+# --- PERMIT STATUS COUNTS ---
+def get_permit_status_counts():
+    pipeline = [
+        {
+            "$group": {
+                "_id": "$status",
+                "count": {"$sum": 1}
+            }
+        }
+    ]
+    results = list(permit_collection.aggregate(pipeline))
+    status_counts = {str(r["_id"]).lower(): r["count"] for r in results}
+    return status_counts
 
 @app.route('/')
 def home():
@@ -213,38 +233,263 @@ def home():
 def chatbot_response():
     user_input = request.json.get("message", "").lower()
 
-    # Case 1: Cumulative employee violations
-    emp_match = re.search(r"(adv\d+)", user_input)
-    if emp_match and any(word in user_input for word in ["violation", "alert", "incident", "ppe", "slip", "record"]):
-        emp_id = emp_match.group(1).upper()
+    # --- Case 0: Permit Queries ---
+    permit_match = re.search(r"\b(pw-\w+-\d+)\b", user_input, re.IGNORECASE)
+    if permit_match:
+        permit_number = permit_match.group().upper()
+        permit = db["permits"].find_one({"permitNumber": permit_number})
+        if not permit:
+            return jsonify({"reply": [f"❌ No permit found with number {permit_number}."]})
+
+        reply_lines = []
+
+        # Count extensions
+        if "how many" in user_input and ("extend" in user_input or "extension" in user_input):
+            exts = permit.get("extensionHistory", [])
+            count = len(exts)
+            reply_lines.append(f"📊 Permit **{permit_number}** has been extended **{count} time(s)**.")
+            return jsonify({"reply": reply_lines})
+
+        # Extension details
+        elif "extend" in user_input or "extension" in user_input:
+            exts = permit.get("extensionHistory", [])
+            if not exts:
+                reply_lines.append("❌ No extension history found.")
+            else:
+                for e in exts:
+                    reply_lines.append(
+                        f"📌 Extended from {e['oldEndDateTime']} → {e['newEndDateTime']} "
+                        f"at {e['updatedAt']}"
+                    )
+            return jsonify({"reply": reply_lines})
+
+        # General Permit Queries
+        if "status" in user_input:
+            reply_lines.append(f"📌 Permit **{permit_number}** is currently **{permit.get('status','N/A')}**")
+        elif "start" in user_input and "end" in user_input:
+            reply_lines.append(f"⏳ Permit **{permit_number}** runs from **{permit.get('startDateTime')}** to **{permit.get('endDateTime')}**")
+        elif "type" in user_input:
+            reply_lines.append(f"🛠️ Permit **{permit_number}** is for **{permit.get('workType','N/A')}** work")
+        elif "location" in user_input:
+            reply_lines.append(f"📍 Work location: **{permit.get('formLocation','N/A')}**")
+        elif "created" in user_input or "updated" in user_input:
+            reply_lines.append(f"🕒 Created: {permit.get('createdAt')} | Last Updated: {permit.get('updatedAt')}")
+
+        elif "worker" in user_input or "workers" in user_input:
+            workers = permit.get("workers", [])
+            if not workers:
+                reply_lines.append("❌ No workers assigned.")
+            else:
+                reply_lines.append(f"👷 Workers in permit **{permit_number}**:")
+                for w in workers:
+                    reply_lines.append(f" - {w.get('workerName','N/A')} (ID: {w.get('workerId','N/A')}, Dept: {w.get('department','N/A')})")
+
+        elif "activity" in user_input:
+            reply_lines.append(f"📝 Activity: {permit.get('activityDescription','N/A')}")
+        elif "risk" in user_input:
+            reply_lines.append(f"⚠️ Risk Assessment: {permit.get('riskAssessment','N/A')}")
+        elif "declaration" in user_input:
+            declarations = permit.get("declarations", {})
+            yes_decls = [k for k,v in declarations.items() if v == "YES"]
+            reply_lines.append(f"✅ Confirmed Declarations: {', '.join(yes_decls)}")
+
+        elif "approval" in user_input or "approver" in user_input:
+            approvals = []
+            for i in [1,2]:
+                appr = permit.get(f"approval{i}")
+                if appr:
+                    approvals.append(f"{appr.get('name')} ({appr.get('status')}) at {appr.get('timestamp')}")
+            if approvals:
+                reply_lines.append("📝 Approvals:\n" + "\n".join(approvals))
+            else:
+                reply_lines.append("❌ No approvals found.")
+
+        elif "history" in user_input or "inprogress" in user_input or "overdue" in user_input:
+            status_hist = permit.get("statusHistory", [])
+            if not status_hist:
+                reply_lines.append("❌ No status history found.")
+            else:
+                reply_lines.append(f"📜 Status History for {permit_number}:")
+                for s in status_hist:
+                    reply_lines.append(f" - {s['status']} at {s['timestamp']}")
+
+        else:
+            reply_lines.append(
+                f"📋 **Permit {permit_number}**\n"
+                f"🛠️ Type: {permit.get('workType','N/A')}\n"
+                f"📍 Location: {permit.get('formLocation','N/A')}\n"
+                f"⏳ Start: {permit.get('startDateTime')} → End: {permit.get('endDateTime')}\n"
+                f"📌 Status: {permit.get('status','N/A')}\n"
+            )
+
+        return jsonify({"reply": reply_lines})
+
+    # --- Case: Permit Status Counts ---
+    if "permit status count" in user_input or "how many permits" in user_input:
+        status_counts = get_permit_status_counts()
+        reply_lines = ["📊 **Permit Status Summary**:"]
+        reply_lines.append(f"🟡 Pending: {status_counts.get('pending', 0)}")
+        reply_lines.append(f"🔵 In Progress: {status_counts.get('in progress', 0)}")
+        reply_lines.append(f"🟠 Extended: {status_counts.get('extended', 0)}")
+        reply_lines.append(f"🔴 Overdue: {status_counts.get('overdue', 0)}")
+        reply_lines.append(f"✅ Closed: {status_counts.get('closed', 0)}")
+        return jsonify({"reply": reply_lines})
+
+    # --- Case: All pending permits today ---
+    if "pending permits" in user_input and "today" in user_input:
+        today = datetime.now().date()
+        start_of_day = datetime.combine(today, datetime.min.time())
+        end_of_day = datetime.combine(today, datetime.max.time())
+
+        permits = list(permit_collection.find({
+            "status": "PENDING",
+            "startDateTime": {"$gte": start_of_day, "$lte": end_of_day}
+        }))
+
+        if not permits:
+            return jsonify({"reply": ["✅ No pending permits for today."]})
+
+        reply_lines = ["📋 **Pending Permits for Today:**"]
+        for p in permits:
+            reply_lines.append(
+                f" - {p['permitNumber']} ({p.get('workType','N/A')}) "
+                f"from {p.get('startDateTime')} to {p.get('endDateTime')}"
+            )
+        reply_lines.append(f"📊 Total: {len(permits)} permit(s).")
+        return jsonify({"reply": reply_lines})
+
+    # --- Case: All pending permits till date ---
+    if "pending permits" in user_input and "till date" in user_input:
+        today = datetime.now()
+        permits = list(permit_collection.find({
+            "status": "PENDING",
+            "endDateTime": {"$lte": today}
+        }))
+
+        if not permits:
+            return jsonify({"reply": ["✅ No pending permits till date."]})
+
+        reply_lines = ["📋 **Pending Permits Till Date:**"]
+        for p in permits:
+            reply_lines.append(
+                f" - {p['permitNumber']} ({p.get('workType','N/A')}) "
+                f"from {p.get('startDateTime')} to {p.get('endDateTime')}"
+            )
+        reply_lines.append(f"📊 Total: {len(permits)} permit(s).")
+        return jsonify({"reply": reply_lines})
+
+    # --- Case: Month-wise pending permits count ---
+    if ("pending permits" in user_input and "month" in user_input) or "month wise" in user_input:
+        pipeline = [
+            {"$match": {"status": "PENDING"}},
+            {"$group": {
+                "_id": {"year": {"$year": "$endDateTime"}, "month": {"$month": "$endDateTime"}},
+                "count": {"$sum": 1}
+            }},
+            {"$sort": {"_id.year": 1, "_id.month": 1}}
+        ]
+        results = list(permit_collection.aggregate(pipeline))
+
+        if not results:
+            return jsonify({"reply": ["✅ No pending permits found in any month."]})
+
+        reply_lines = ["📊 **Month-wise Pending Permits Count:**"]
+        for r in results:
+            year = r["_id"]["year"]
+            month = r["_id"]["month"]
+            reply_lines.append(f" - {year}-{month:02d}: {r['count']} permit(s)")
+        return jsonify({"reply": reply_lines})
+
+    # --- Case: Permits extended beyond original end time ---
+    if "extended beyond" in user_input or "overdue permits" in user_input:
+        permits = list(permit_collection.find({"extensionHistory": {"$exists": True, "$ne": []}}))
+        extended_permits = []
+        for p in permits:
+            end_time = p.get("endDateTime")
+            exts = p.get("extensionHistory", [])
+            if not end_time or not exts:
+                continue
+            latest_ext = max(exts, key=lambda e: e["newEndDateTime"])
+            if latest_ext["newEndDateTime"] > end_time:
+                extended_permits.append((p["permitNumber"], latest_ext))
+
+        if not extended_permits:
+            return jsonify({"reply": ["✅ No permits extended beyond their original end time."]})
+
+        reply_lines = ["📌 **Permits Extended Beyond Original End Time:**"]
+        for num, e in extended_permits:
+            reply_lines.append(
+                f" - {num}: Extended to {e['newEndDateTime']} (original end {e['oldEndDateTime']})"
+            )
+        reply_lines.append(f"📊 Total: {len(extended_permits)} permit(s).")
+        return jsonify({"reply": reply_lines})
+    
+    
+    # Case 1: Cumulative person (employee/visitor) violations
+    id_match = re.search(r"\b(adv\d{2,4}|emp\d{2,4}|vst\d{2,4})\b", user_input, re.IGNORECASE)
+    if id_match and any(word in user_input for word in ["violation", "alert", "incident", "ppe", "slip", "record"]):
+        person_id = id_match.group().upper()
+        person = get_person_details(person_id)
+
+        if not person:
+            return jsonify({"reply": [f"❌ No record found with ID {person_id}."]})
+
+        emp_id = person.get("personId")
+
+        # Fetch violations across all collections
         violations = get_violations_by_employee(emp_id)
         if not violations:
-            return jsonify({"reply": [f"No violations found for employee {emp_id}."]})
-        response = [f"📋 **Violations for {emp_id}**:"]
+            return jsonify({"reply": [f"✅ No violations found for {emp_id} ({person.get('name','Unknown')})."]})
+
+        # Format response
+        response = [f"📋 **Violations for {emp_id} ({person.get('name','Unknown')})**:"]
         for v in violations[:5]:
             ts = v.get("timestamp", "N/A")
-            details = ", ".join([f"{k}: {v[k]}" for k in v if k not in EXCLUDED_FIELDS and not isinstance(v[k], (dict, list))])
+            # Include only relevant fields (exclude internal/extraneous ones)
+            details = ", ".join([
+                f"{k}: {v[k]}" for k in v
+                if k not in EXCLUDED_FIELDS and k not in ["_id", "__v", "source", "timestamp"] 
+                and not isinstance(v[k], (dict, list))
+            ])
             response.append(f"🔸 {ts} | Source: {v['source']} | {details}")
+
         return jsonify({"reply": response})
+
     
-    # Case 2: Direct employee info
-    emp_id_match = re.search(r'\badv\d{3}\b', user_input)
-    if emp_id_match:
-        emp_id = emp_id_match.group().upper()
-        emp = db.employeedatas.find_one({"EmployeeID": emp_id})
-        if emp:
-            response = (
-                "🧑‍🏭 **Employee Details:**\n\n"
-                f"👤 Name: **{emp.get('Name', 'N/A')}**\n"
-                f"📧 Email: {emp.get('EmailID', 'N/A')}\n"
-                f"📞 Mobile: {emp.get('Mobilenumber', 'N/A')}\n"
-                f"🏢 Dept: {emp.get('Department', 'N/A')}\n"
-                f"💼 Designation: {emp.get('Designation', 'N/A')}\n"
-                f"📍 Location: {emp.get('Location', 'N/A')}\n"
-            )
-            return jsonify({"reply": response.strip().split("\n")})
+    # Case 2:  employee/visitor details
+    id_match = re.search(r"\b(adv\d{2,4}|emp\d{2,4}|vst\d{2,4})\b", user_input, re.IGNORECASE)
+    if id_match:
+        person_id = id_match.group().upper()
+        person = get_person_details(person_id)
+        
+        if person:
+            if person.get("personType") == "employee":
+                response = (
+                    "🧑‍🏭 **Employee Details:**\n\n"
+                    f"👤 Name: **{person.get('name', 'N/A')}**\n"
+                    f"📧 Email: {person.get('email', 'N/A')}\n"
+                    f"📞 Mobile: {person.get('mobileNumber', 'N/A')}**\n"
+                    f"🏢 Dept: {person.get('department', 'N/A')}**\n"
+                    f"💼 Designation: {person.get('designation', 'N/A')}**\n"
+                    f"📍 Location: {person.get('location', 'N/A')}**\n"
+                    f"🆔 RFID: {person.get('rfid', 'N/A')}**\n"
+                )
+            elif person.get("personType") == "visitor":
+                response = (
+                    "🧑‍💼 **Visitor Details:**\n\n"
+                    f"👤 Name: **{person.get('name', 'N/A')}**\n"
+                    f"🏢 Company: {person.get('company', 'N/A')}**\n"
+                    f"💼 Designation: {person.get('designation', 'N/A')}**\n"
+                    f"🎯 Purpose: {person.get('purpose', 'N/A')}**\n"
+                    f"📅 From: {person.get('fromDateTime', 'N/A')}**\n"
+                    f"📅 To: {person.get('toDateTime', 'N/A')}**\n"
+                )
+            else:
+                response = f"⚠️ Record found but unknown personType: {person.get('personType')}"
         else:
-            return jsonify({"reply": f"❌ No employee found with ID {emp_id}."})
+            response = f"❌ No record found with ID {person_id}."
+
+        return jsonify({"reply": response.strip().split("\n")})
         
     # case 3 : 
     unauth_terms = ["unauthorized", "trespass", "intruder", "unidentified", "trespasser",
