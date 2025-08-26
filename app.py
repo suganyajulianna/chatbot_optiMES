@@ -211,19 +211,40 @@ def get_latest_from_collections(collection_names, user_input=None):
 def get_permit_by_number(permit_number):
     return permit_collection.find_one({"permitNumber": permit_number})
 
+# --- SPECIFIC PERMIT STATUS COUNT ---
+def get_specific_permit_status_count(user_input):
+    """
+    Check if user asks for count of a specific permit status
+    and return the count along with normalized status.
+    """
+    status_terms = ["approved", "pending", "inprogress", "cancelled",
+                    "closed", "overdue", "completed", "extended"]
+
+    for status in status_terms:
+        if status.replace(" ", "") in user_input.replace(" ", ""):
+            # Count documents with case-insensitive match
+            count = permit_collection.count_documents({
+                "status": {"$regex": f"^{status}$", "$options": "i"}
+            })
+            return count, status.title()
+    return None, None
+
 # --- PERMIT STATUS COUNTS ---
 def get_permit_status_counts():
     pipeline = [
-        {
-            "$group": {
-                "_id": "$status",
-                "count": {"$sum": 1}
-            }
-        }
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
     ]
     results = list(permit_collection.aggregate(pipeline))
     status_counts = {str(r["_id"]).lower(): r["count"] for r in results}
+
+    # Ensure all statuses exist even if count = 0
+    all_statuses = ["approved", "pending", "inprogress", "cancelled", 
+                    "closed", "overdue", "completed", "extended"]
+    for s in all_statuses:
+        status_counts.setdefault(s, 0)
+
     return status_counts
+
 
 @app.route('/')
 def home():
@@ -242,6 +263,8 @@ def chatbot_response():
             return jsonify({"reply": [f"❌ No permit found with number {permit_number}."]})
 
         reply_lines = []
+
+        
 
         # Count extensions
         if "how many" in user_input and ("extend" in user_input or "extension" in user_input):
@@ -324,16 +347,26 @@ def chatbot_response():
 
         return jsonify({"reply": reply_lines})
 
-    # --- Case: Permit Status Counts ---
+
+    # --- Case 1: Specific Permit Status Count (no permit number, just status) ---
+    count, status_title = get_specific_permit_status_count(user_input)
+    if count is not None:
+        return jsonify({"reply": [f"📊 There are **{count}** permit(s) in **{status_title}** status."]})
+
+    # --- Case 2: Overall Permit Status Summary ---
     if "permit status count" in user_input or "how many permits" in user_input:
         status_counts = get_permit_status_counts()
         reply_lines = ["📊 **Permit Status Summary**:"]
-        reply_lines.append(f"🟡 Pending: {status_counts.get('pending', 0)}")
-        reply_lines.append(f"🔵 In Progress: {status_counts.get('in progress', 0)}")
-        reply_lines.append(f"🟠 Extended: {status_counts.get('extended', 0)}")
-        reply_lines.append(f"🔴 Overdue: {status_counts.get('overdue', 0)}")
-        reply_lines.append(f"✅ Closed: {status_counts.get('closed', 0)}")
+        reply_lines.append(f"✅ Approved: {status_counts['approved']}")
+        reply_lines.append(f"🟡 Pending: {status_counts['pending']}")
+        reply_lines.append(f"🔵 In Progress: {status_counts['inprogress']}")
+        reply_lines.append(f"❌ Cancelled: {status_counts['cancelled']}")
+        reply_lines.append(f"🔴 Closed: {status_counts['closed']}")
+        reply_lines.append(f"⚠️ Overdue: {status_counts['overdue']}")
+        reply_lines.append(f"✅ Completed: {status_counts['completed']}")
+        reply_lines.append(f"🟠 Extended: {status_counts['extended']}")
         return jsonify({"reply": reply_lines})
+
 
     # --- Case: All pending permits today ---
     if "pending permits" in user_input and "today" in user_input:
@@ -424,7 +457,7 @@ def chatbot_response():
         reply_lines.append(f"📊 Total: {len(extended_permits)} permit(s).")
         return jsonify({"reply": reply_lines})
     
-    
+
     # Case 1: Cumulative person (employee/visitor) violations
     id_match = re.search(r"\b(adv\d{2,4}|emp\d{2,4}|vst\d{2,4})\b", user_input, re.IGNORECASE)
     if id_match and any(word in user_input for word in ["violation", "alert", "incident", "ppe", "slip", "record"]):
@@ -600,6 +633,8 @@ def chatbot_response():
             "1️⃣ Hazard Warnings – Fire, smoke, gas leak incidents.",
             "2️⃣ Worker Health & Safety – Slips, PPE violations, worker safety.",
             "3️⃣ Compliance Policies – Occupancy control, unauthorized entry.",
+            
+                 
             "💡 You can ask me about recent alerts, employee details, policy breaches, and more."
         ]})
     
