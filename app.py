@@ -11,7 +11,8 @@ CORS(app)
 
 # MongoDB Connection
 # MONGO_URI = "mongodb+srv://srmrmpparthiban:20a8yW18xd48XYJ9@cluster0.vviu6.mongodb.net/optimus"
-MONGO_URI = "mongodb+srv://adventistech2025:XOGhPBZxi0gDSPNO@cluster0.awnrusw.mongodb.net/OptiMES40"
+# MONGO_URI = "mongodb+srv://adventistech2025:XOGhPBZxi0gDSPNO@cluster0.awnrusw.mongodb.net/OptiMES40"
+MONGO_URI = "mongodb+srv://adventistech2025:adventistech2025@cluster0.8pgh2fg.mongodb.net/optimestest"
 client = MongoClient(MONGO_URI)
 db = client["OptiMES40"]
 permit_collection = db["permits"]
@@ -791,3 +792,4 @@ def chatbot_response():
   
 if __name__ == '__main__':
     app.run(debug=False, host="0.0.0.0", port=5001)
+
