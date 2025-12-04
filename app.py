@@ -283,162 +283,39 @@ def chatbot_response():
         if pattern in user_input:
             return jsonify({"reply": ["⚡ **Total Energy Cost:** ₹ 1,21,800"]})
     
-    # 3. Lowest Production Shift - Multiple variations
-    lowest_patterns = [
-        "lowest production shift", "least production shift", 
-        "worst production shift", "minimum production shift",
-        "poor production shift", "which shift has lowest production",
-        "lowest output shift", "least productive shift",
-        "shift with lowest production", "worst performing shift"
-    ]
+    # 3. Lowest Production Shift - FIXED: More flexible matching
+    lowest_words = ["lowest", "least", "minimum", "worst", "poor"]
+    shift_words = ["shift", "batch", "schedule"]
+    production_words = ["production", "output", "bottles", "manufacturing"]
     
-    for pattern in lowest_patterns:
-        if pattern in user_input:
-            return jsonify({"reply": [
-                "📉 **Lowest Production Shift:**",
-                "🔸 **Shift C** – 12,480 Bottles",
-                "",
-                "**Reason:**",
-                "• 1 hr planned maintenance",
-                "• 30 min material waiting",
-                "• Low manpower"
-            ]})
+    # Check for questions about lowest production shift
+    if (any(word in user_input for word in lowest_words) and 
+        any(word in user_input for word in shift_words) and 
+        any(word in user_input for word in production_words)) or \
+       ("which shift" in user_input and any(word in user_input for word in lowest_words)) or \
+       ("lowest production" in user_input) or \
+       ("which shift has lowest" in user_input):
+        
+        return jsonify({"reply": [
+            "📉 **Lowest Production Shift:**",
+            "🔸 **Shift C** – 12,480 Bottles",
+            "",
+            "**Reason:**",
+            "• 1 hr planned maintenance",
+            "• 30 min material waiting",
+            "• Low manpower"
+        ]})
     
-    # 4. Shift-wise Production - Multiple variations
-    shift_patterns = [
-        "shift wise production", "production by shift", 
-        "all shift production", "each shift production",
-        "production per shift", "shift production details",
-        "production for all shifts", "shift output"
-    ]
-    
-    for pattern in shift_patterns:
-        if pattern in user_input:
-            return jsonify({"reply": [
-                "📊 **Shift-wise Production Today:**",
-                "🔸 **Shift A** – 12,450 Bottles",
-                "🔸 **Shift B** – 12,439 Bottles",
-                "🔸 **Shift C** – 12,480 Bottles",
-                "",
-                "📈 **Total:** 37,369 Bottles"
-            ]})
-    
-    # 5. Production Efficiency - Multiple variations
-    efficiency_patterns = [
-        "production efficiency", "manufacturing efficiency",
-        "line efficiency", "production performance",
-        "how efficient today", "efficiency rate",
-        "production rate", "bottles per hour"
-    ]
-    
-    for pattern in efficiency_patterns:
-        if pattern in user_input:
-            return jsonify({"reply": [
-                "📈 **Production Efficiency Today:**",
-                "• Overall Efficiency: 87.5%",
-                "• Line 1: 89.2%",
-                "• Line 2: 86.1%",
-                "• Line 3: 87.2%",
-                "• Average Output: 1,557 bottles/hour"
-            ]})
-    
-    # 6. Downtime - Multiple variations
-    downtime_patterns = [
-        "downtime today", "production downtime",
-        "machine downtime", "line stoppage",
-        "breakdown time", "maintenance time",
-        "how much downtime", "stoppage time"
-    ]
-    
-    for pattern in downtime_patterns:
-        if pattern in user_input:
-            return jsonify({"reply": [
-                "⏱️ **Downtime Summary Today:**",
-                "• Total Downtime: 2.5 hours",
-                "• Planned Maintenance: 1.0 hour",
-                "• Unplanned Breakdown: 0.5 hour",
-                "• Material Waiting: 0.5 hour",
-                "• Changeover: 0.5 hour"
-            ]})
-    
-    # 7. Quality Issues - Multiple variations
-    quality_patterns = [
-        "quality issues", "defective bottles",
-        "rejection rate", "quality problems",
-        "defect rate", "quality percentage",
-        "how many defects", "rejected bottles"
-    ]
-    
-    for pattern in quality_patterns:
-        if pattern in user_input:
-            return jsonify({"reply": [
-                "✅ **Quality Report Today:**",
-                "• Total Produced: 37,369 Bottles",
-                "• Defective: 187 Bottles (0.5%)",
-                "• Rejection Rate: 0.5%",
-                "• Good Bottles: 37,182 (99.5%)",
-                "• Quality Target: 99.7%"
-            ]})
-    
-    # 8. Production Target - Multiple variations
-    target_patterns = [
-        "production target", "daily target",
-        "target achievement", "target vs actual",
-        "did we meet target", "production goal",
-        "target bottles", "expected production"
-    ]
-    
-    for pattern in target_patterns:
-        if pattern in user_input:
-            return jsonify({"reply": [
-                "🎯 **Production Target Today:**",
-                "• Target: 40,000 Bottles",
-                "• Actual: 37,369 Bottles",
-                "• Achievement: 93.4%",
-                "• Shortfall: 2,631 Bottles",
-                "• Status: Below Target ❌"
-            ]})
-    
-    # 9. Manpower - Multiple variations
-    manpower_patterns = [
-        "manpower today", "workers today",
-        "staff count", "how many workers",
-        "manpower status", "employee count",
-        "workers present", "absent workers"
-    ]
-    
-    for pattern in manpower_patterns:
-        if pattern in user_input:
-            return jsonify({"reply": [
-                "👷 **Manpower Status Today:**",
-                "• Total Workers: 156",
-                "• Present: 148 (94.9%)",
-                "• Absent: 8 (5.1%)",
-                "• Overtime: 32 workers",
-                "• Shift A: 52 workers",
-                "• Shift B: 48 workers",
-                "• Shift C: 48 workers"
-            ]})
-    
-    # 10. Raw Material - Multiple variations
-    material_patterns = [
-        "raw material", "material consumption",
-        "material usage", "material status",
-        "material stock", "material inventory",
-        "how much material", "material quantity"
-    ]
-    
-    for pattern in material_patterns:
-        if pattern in user_input:
-            return jsonify({"reply": [
-                "📦 **Raw Material Status Today:**",
-                "• PET Resin: 12,500 kg (78% remaining)",
-                "• Labels: 45,000 pcs (82% remaining)",
-                "• Caps: 50,000 pcs (85% remaining)",
-                "• Cleaning Agents: 120 liters (60% remaining)",
-                "• Status: Sufficient for 3 days"
-            ]})
-
+    # 4. Why questions specifically
+    if "why" in user_input and any(word in user_input for word in ["lowest", "least", "worst", "poor"]):
+        return jsonify({"reply": [
+            "📉 **Lowest Production Shift was Shift C**",
+            "",
+            "**Reasons for low production:**",
+            "• 1 hr planned maintenance",
+            "• 30 min material waiting",
+            "• Low manpower"
+        ]})
 
     # --- Case 0: Permit Queries ---
     permit_match = re.search(r"\b(pw-\w+-\d+)\b", user_input, re.IGNORECASE)
@@ -977,4 +854,5 @@ def chatbot_response():
   
 if __name__ == '__main__':
     app.run(debug=False, host="0.0.0.0", port=5001)
+
 
