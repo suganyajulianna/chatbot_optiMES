@@ -255,6 +255,24 @@ def home():
 def chatbot_response():
     user_input = request.json.get("message", "").lower()
 
+    # --- Hardcoded Production Questions ---
+    if "what is my production today" in user_input or "production today" in user_input:
+        return jsonify({"reply": ["📊 **Total Production Today:** 37,369 Bottles"]})
+    
+    if "energy cost" in user_input and ("today" in user_input or "same" in user_input or "production" in user_input):
+        return jsonify({"reply": ["⚡ **Total Energy Cost:** ₹ 1,21,800"]})
+    
+    if ("lowest production" in user_input or "least production" in user_input) and "shift" in user_input:
+        return jsonify({"reply": [
+            "📉 **Lowest Production Shift:**",
+            "🔸 **Shift C** – 12,480 Bottles",
+            "",
+            "**Reason:**",
+            "• 1 hr planned maintenance",
+            "• 30 min material waiting",
+            "• Low manpower"
+        ]})
+
     # --- Case 0: Permit Queries ---
     permit_match = re.search(r"\b(pw-\w+-\d+)\b", user_input, re.IGNORECASE)
     if permit_match:
@@ -792,5 +810,4 @@ def chatbot_response():
   
 if __name__ == '__main__':
     app.run(debug=False, host="0.0.0.0", port=5001)
-
 
