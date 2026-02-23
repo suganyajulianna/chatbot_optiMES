@@ -142,6 +142,12 @@ MAINTENANCE_BUTTONS = [
     # {"text": "Equipment under maintenance", "action": "Equipment under maintenance"}
 ]
 
+MODULE_OVERVIEW_BUTTONS = [
+    {"text": "Safety", "action": "last alert"},
+    {"text": "CMMS", "action": "cmms help"},
+    {"text": "Inventory", "action": "inventory help"}
+]
+
 # Emoji mapping
 EMOJI_MAP = {
     "priority": "⚠️", "person_count_status": "👥", "vacancy_status": "💺",
@@ -1274,6 +1280,12 @@ def _format_export_title(query):
     # Generic fallback: remove trailing question mark and uppercase
     return q.rstrip("?").upper() if q else "EXPORTED DETAILS"
 
+def _slugify_filename(text):
+    """Create filesystem-safe lowercase token for filenames."""
+    token = _clean_pdf_line(text).lower()
+    token = re.sub(r"[^a-z0-9]+", "_", token).strip("_")
+    return token or "exported_details"
+
 def _extract_workorder_rows(lines):
     """Extract normalized workorder rows from chat lines, if present."""
     rows = []
@@ -1519,7 +1531,7 @@ def _extract_low_stock_rows(lines):
                 "Product ID": product_match.group(2).strip(),
                 "Severity": product_match.group(3).upper(),
                 "Current Stock": "",
-                "Threshold": "",
+                "Low Stock Value": "",
                 "Category": "",
                 "Locations": ""
             }
@@ -1534,7 +1546,7 @@ def _extract_low_stock_rows(lines):
             if "/ threshold:" in value.lower():
                 parts = re.split(r"/\s*threshold:\s*", value, flags=re.IGNORECASE)
                 current["Current Stock"] = parts[0].strip()
-                current["Threshold"] = parts[1].strip() if len(parts) > 1 else ""
+                current["Low Stock Value"] = parts[1].strip() if len(parts) > 1 else ""
             else:
                 current["Current Stock"] = value
         elif low.startswith("category:"):
@@ -1544,6 +1556,29 @@ def _extract_low_stock_rows(lines):
 
     if current:
         rows.append(current)
+
+    # Prefer authoritative lowStockValue from products collection when productId is available.
+    for row in rows:
+        product_id = (row.get("Product ID") or "").strip()
+        if not product_id:
+            continue
+
+        product = INVENTORY_COLLECTIONS["products"].find_one({
+            "productId": {"$regex": f"^{re.escape(product_id)}$", "$options": "i"}
+        })
+
+        if not product:
+            # Fallback match ignoring spaces around hyphens.
+            compact = re.sub(r"\s+", "", product_id)
+            pattern = "^" + re.escape(compact).replace(r"\-", r"\s*-\s*") + "$"
+            product = INVENTORY_COLLECTIONS["products"].find_one({
+                "productId": {"$regex": pattern, "$options": "i"}
+            })
+
+        if product and product.get("lowStockValue") is not None:
+            unit = product.get("unit", "")
+            value = str(product.get("lowStockValue"))
+            row["Low Stock Value"] = f"{value} {unit}".strip()
 
     return rows
 
@@ -1597,7 +1632,7 @@ def export_pdf():
         rows = [[r.get(h, "") for h in headers] for r in location_rows]
         col_widths = [116, 96, 80, 72, 74, 58]
     elif low_stock_rows:
-        headers = ["Product Name", "Product ID", "Severity", "Current Stock", "Threshold", "Category", "Locations"]
+        headers = ["Product Name", "Product ID", "Severity", "Current Stock", "Low Stock Value", "Category", "Locations"]
         rows = [[r.get(h, "") for h in headers] for r in low_stock_rows]
         col_widths = [86, 74, 70, 72, 72, 66, 96]
     else:
@@ -1645,12 +1680,13 @@ def export_pdf():
     doc.build(story)
     buffer.seek(0)
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    name_token = _slugify_filename(title)
     return send_file(
         buffer,
         mimetype="application/pdf",
         as_attachment=True,
-        download_name=f"workorder_details_{stamp}.pdf"
+        download_name=f"{name_token}_report_{stamp}.pdf"
     )
 
 @app.route('/chat', methods=['POST'])
@@ -3072,10 +3108,23 @@ def chatbot_response():
         elif "compliance" in user_input or "policies" in user_input:
             collections = ["occupancies", "unauthorizedentries"]
 
-    # As a last resort, if nothing matched
-    if not collections:
-        print("⚠️ No specific module inferred. Falling back to ALL collections.")
+    # Allow generic safety "last/latest/recent alert" queries even without module keywords
+    if not collections and (
+        any(k in user_input for k in ["last", "latest", "recent"]) and
+        any(t in user_input for t in ["alert", "incident", "violation", "event"])
+    ):
         collections = ALL_COLLECTIONS
+
+    # As a last resort, if nothing matched show module overview (no last-alert fallback)
+    if not collections:
+        return jsonify({
+            "reply": [
+                "I could not understand that query.",
+                "",
+                "Please choose a module:"
+            ],
+            "buttons": MODULE_OVERVIEW_BUTTONS
+        })
 
     latest_docs = get_latest_from_collections(collections, user_input=user_input)
 
