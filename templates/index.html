@@ -322,13 +322,20 @@
             const err = await response.json().catch(() => ({ error: "Failed to export PDF." }));
             throw new Error(err.error || "Failed to export PDF.");
           }
-          return response.blob();
+          const blob = await response.blob();
+          const disposition = response.headers.get("Content-Disposition") || "";
+          let filename = "";
+          const match = disposition.match(/filename\*?=(?:UTF-8''|\"?)([^\";]+)/i);
+          if (match && match[1]) {
+            filename = decodeURIComponent(match[1]).replace(/\"/g, "");
+          }
+          return { blob, filename };
         })
-        .then((blob) => {
+        .then(({ blob, filename }) => {
           const url = window.URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
-          a.download = "workorder_details.pdf";
+          a.download = filename || `report_${new Date().toISOString().slice(0, 10)}.pdf`;
           document.body.appendChild(a);
           a.click();
           a.remove();
