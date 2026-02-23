@@ -4,13 +4,15 @@ from bson.objectid import ObjectId
 from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
 from io import BytesIO
-import textwrap
 import os
 import re
 
 try:
     from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
     from reportlab.pdfgen import canvas
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -63,6 +65,17 @@ WORKORDER_STATUS_ALIASES = {
     "closed": ["closed"],
     "open": ["open"],
     "assigned": ["assigned"]
+}
+
+PERMIT_STATUS_ALIASES = {
+    "approved": ["approved"],
+    "pending": ["pending"],
+    "inprogress": ["in progress", "inprogress"],
+    "completed": ["completed"],
+    "overdue": ["overdue"],
+    "extended": ["extended"],
+    "cancelled": ["cancelled", "canceled"],
+    "closed": ["closed"]
 }
 
 # Maintenance Keywords - More specific to avoid confusion
@@ -1181,6 +1194,62 @@ def get_permit_status_counts():
 
     return status_counts
 
+def extract_permit_status(user_input):
+    """Extract canonical permit status from user query."""
+    for canonical, aliases in PERMIT_STATUS_ALIASES.items():
+        for alias in aliases:
+            if re.search(r"\b" + re.escape(alias) + r"\b", user_input):
+                return canonical
+    return None
+
+def get_permits_by_status_and_date(status_key, start_date, end_date):
+    """Filter permits by status and overlapping start/end date range."""
+    status_pattern = {
+        "inprogress": r"in\s*progress",
+        "cancelled": r"cancelled|canceled"
+    }.get(status_key, re.escape(status_key))
+
+    permits = list(permit_collection.find({
+        "status": {"$regex": status_pattern, "$options": "i"}
+    }))
+
+    filtered = []
+    for p in permits:
+        start_dt = p.get("startDateTime")
+        end_dt = p.get("endDateTime")
+        if isinstance(start_dt, str):
+            start_dt = parse_any_date_value(start_dt)
+        if isinstance(end_dt, str):
+            end_dt = parse_any_date_value(end_dt)
+        if not start_dt and not end_dt:
+            continue
+
+        s = start_dt or end_dt
+        e = end_dt or start_dt
+        s = s.replace(tzinfo=None) if getattr(s, "tzinfo", None) else s
+        e = e.replace(tzinfo=None) if getattr(e, "tzinfo", None) else e
+
+        # Overlap condition between permit interval and selected interval
+        if s <= end_date and e >= start_date:
+            filtered.append(p)
+    return filtered
+
+def format_permit_filter_response(permits, status_key, label):
+    status_title = "In Progress" if status_key == "inprogress" else status_key.title()
+    if not permits:
+        return [f"No {status_title} permits found for {label}."]
+
+    reply = [f"Permits ({status_title}) for {label} ({len(permits)} items)"]
+    for i, p in enumerate(permits, 1):
+        reply.append(f"{i}. Permit Number: {p.get('permitNumber', 'N/A')}")
+        reply.append(f"   Work Type: {p.get('workType', 'N/A')}")
+        reply.append(f"   Status: {p.get('status', 'N/A')}")
+        reply.append(f"   Start Date: {p.get('startDateTime', 'N/A')}")
+        reply.append(f"   End Date: {p.get('endDateTime', 'N/A')}")
+        reply.append(f"   Location: {p.get('formLocation', 'N/A')}")
+        reply.append("")
+    return reply
+
 # ==================== ROUTES ====================
 
 def _clean_pdf_line(text):
@@ -1188,6 +1257,295 @@ def _clean_pdf_line(text):
     line = str(text) if text is not None else ""
     line = line.replace("**", "")
     return re.sub(r"\s+", " ", line).strip()
+
+def _format_export_title(query):
+    """Build a clean export title from user query."""
+    q = _clean_pdf_line(query).strip()
+    q_low = q.lower()
+
+    # Inventory specific report-style titles
+    if "recent stock movement" in q_low:
+        return "RECENT STOCK MOVEMENTS"
+    if ("what locations are available" in q_low or
+        "available locations" in q_low or
+        "locations available" in q_low):
+        return "AVAILABLE INVENTORY LOCATIONS"
+
+    # Generic fallback: remove trailing question mark and uppercase
+    return q.rstrip("?").upper() if q else "EXPORTED DETAILS"
+
+def _extract_workorder_rows(lines):
+    """Extract normalized workorder rows from chat lines, if present."""
+    rows = []
+    current = None
+
+    for raw in lines:
+        line = _clean_pdf_line(raw)
+        if not line:
+            continue
+
+        m = re.match(r"^\d+\.\s*Workorder ID:\s*(.*)$", line, re.IGNORECASE)
+        if m:
+            if current:
+                rows.append(current)
+            current = {
+                "Workorder ID": m.group(1).strip(),
+                "Workorder Type": "",
+                "Equipment ID": "",
+                "Status": "",
+                "Due Date": "",
+                "Assigned To": "",
+                "Full Name": ""
+            }
+            continue
+
+        if not current:
+            continue
+
+        low = line.lower()
+        if low.startswith("workorder type:"):
+            current["Workorder Type"] = line.split(":", 1)[1].strip()
+        elif low.startswith("equipment id:"):
+            current["Equipment ID"] = line.split(":", 1)[1].strip()
+        elif low.startswith("status:"):
+            current["Status"] = line.split(":", 1)[1].strip()
+        elif low.startswith("due date:"):
+            current["Due Date"] = line.split(":", 1)[1].strip()
+        elif low.startswith("assigned to:"):
+            current["Assigned To"] = line.split(":", 1)[1].strip()
+        elif low.startswith("full name:"):
+            current["Full Name"] = line.split(":", 1)[1].strip()
+
+    if current:
+        rows.append(current)
+    return rows
+
+def _extract_permit_rows(lines):
+    """Extract normalized permit rows from chat lines, if present."""
+    rows = []
+    current = None
+
+    for raw in lines:
+        line = _clean_pdf_line(raw)
+        if not line:
+            continue
+
+        m = re.match(r"^\d+\.\s*Permit Number:\s*(.*)$", line, re.IGNORECASE)
+        if m:
+            if current:
+                rows.append(current)
+            current = {
+                "Permit Number": m.group(1).strip(),
+                "Work Type": "",
+                "Status": "",
+                "Start Date": "",
+                "End Date": "",
+                "Location": ""
+            }
+            continue
+
+        if not current:
+            continue
+
+        low = line.lower()
+        if low.startswith("work type:"):
+            current["Work Type"] = line.split(":", 1)[1].strip()
+        elif low.startswith("status:"):
+            current["Status"] = line.split(":", 1)[1].strip()
+        elif low.startswith("start date:"):
+            current["Start Date"] = line.split(":", 1)[1].strip()
+        elif low.startswith("end date:"):
+            current["End Date"] = line.split(":", 1)[1].strip()
+        elif low.startswith("location:"):
+            current["Location"] = line.split(":", 1)[1].strip()
+
+    if current:
+        rows.append(current)
+    return rows
+
+def _extract_field_value_rows(lines):
+    """Fallback parser for non-workorder responses as Field/Value rows."""
+    rows = []
+    for raw in lines:
+        line = _clean_pdf_line(raw)
+        if not line:
+            continue
+
+        # Ignore section title lines that would duplicate heading
+        if re.match(r"^(workorders?|low stock products?|summary)\b", line, re.IGNORECASE):
+            continue
+
+        if ":" in line:
+            field, value = line.split(":", 1)
+            rows.append([field.strip() or "Field", value.strip()])
+        else:
+            rows.append(["Details", line])
+
+    return rows or [["Details", "No data"]]
+
+def _extract_numbered_records_table(lines):
+    """Extract tabular records from numbered list style bot responses."""
+    records = []
+    current = None
+    discovered = []
+
+    def normalize_key(k):
+        k = re.sub(r"^[^\w]+", "", (k or "").strip())
+        return k if k else "Details"
+
+    def push_current():
+        nonlocal current
+        if current and any(str(v).strip() for v in current.values()):
+            records.append(current)
+        current = None
+
+    for raw in lines:
+        line = _clean_pdf_line(raw)
+        if not line:
+            continue
+
+        m_num = re.match(r"^\d+\.\s*(.*)$", line)
+        if m_num:
+            push_current()
+            current = {"Item": m_num.group(1).strip()}
+            continue
+
+        if current is None:
+            continue
+
+        if ":" in line:
+            k, v = line.split(":", 1)
+            key = normalize_key(k)
+            val = v.strip()
+            current[key] = val
+            if key not in discovered:
+                discovered.append(key)
+        else:
+            if "Details" in current and current["Details"]:
+                current["Details"] = f"{current['Details']} | {line}"
+            else:
+                current["Details"] = line
+            if "Details" not in discovered:
+                discovered.append("Details")
+
+    push_current()
+    if not records:
+        return None, None
+
+    headers = ["Item"] + [h for h in discovered if h != "Item"]
+    rows = []
+    for rec in records:
+        rows.append([rec.get(h, "") for h in headers])
+    return headers, rows
+
+def _extract_inventory_location_rows(lines):
+    """Extract available inventory location blocks into table rows."""
+    rows = []
+    current = None
+
+    for raw in lines:
+        line = _clean_pdf_line(raw)
+        if not line:
+            continue
+
+        # Skip heading lines
+        if re.search(r"available inventory locations", line, re.IGNORECASE):
+            continue
+        if re.search(r"total available capacity", line, re.IGNORECASE):
+            continue
+
+        # Example: "STEEL FACTORY (ID: LOC-DK7-669354)"
+        loc_match = re.match(r"^[^\w]*\s*(.*?)\s*\(ID:\s*(.*?)\)\s*$", line, re.IGNORECASE)
+        if loc_match:
+            if current:
+                rows.append(current)
+            current = {
+                "Location Name": loc_match.group(1).strip(),
+                "Location ID": loc_match.group(2).strip(),
+                "Capacity": "",
+                "Utilization %": "",
+                "Available": "",
+                "Racks": ""
+            }
+            continue
+
+        if not current:
+            continue
+
+        low = line.lower()
+        # Example: Capacity: 37/5000 (0.7% utilized)
+        # Ignore rack detail lines like "• Box2 (Capacity: N/A)"
+        if re.search(r"capacity:\s*\d+\s*/\s*\d+", low):
+            value = line.split(":", 1)[1].strip() if ":" in line else ""
+            util_match = re.search(r"\(([\d\.]+)%\s*utilized\)", value, re.IGNORECASE)
+            current["Capacity"] = re.sub(r"\s*\([\d\.]+%\s*utilized\)\s*", "", value, flags=re.IGNORECASE).strip()
+            current["Utilization %"] = util_match.group(1) + "%" if util_match else ""
+        # Example: Available: 4963 units
+        elif "available:" in low:
+            current["Available"] = line.split(":", 1)[1].strip() if ":" in line else ""
+        # Example: Racks: 1
+        elif "racks:" in low:
+            current["Racks"] = line.split(":", 1)[1].strip() if ":" in line else ""
+
+    if current:
+        rows.append(current)
+
+    return rows
+
+def _extract_low_stock_rows(lines):
+    """Extract low stock rows into a structured table."""
+    rows = []
+    current = None
+
+    for raw in lines:
+        line = _clean_pdf_line(raw)
+        if not line:
+            continue
+
+        # Ignore section/summary lines
+        if re.match(r"^(low stock products|total low stock items)\b", line, re.IGNORECASE):
+            continue
+
+        product_match = re.match(
+            r"^(?:[^\w]*)?(.+?)\s*\(ID:\s*(.*?)\)\s*-\s*(CRITICALLY LOW|LOW STOCK)\s*$",
+            line,
+            re.IGNORECASE
+        )
+        if product_match:
+            if current:
+                rows.append(current)
+            current = {
+                "Product Name": product_match.group(1).strip(),
+                "Product ID": product_match.group(2).strip(),
+                "Severity": product_match.group(3).upper(),
+                "Current Stock": "",
+                "Threshold": "",
+                "Category": "",
+                "Locations": ""
+            }
+            continue
+
+        if not current:
+            continue
+
+        low = line.lower()
+        if low.startswith("current stock:"):
+            value = line.split(":", 1)[1].strip()
+            if "/ threshold:" in value.lower():
+                parts = re.split(r"/\s*threshold:\s*", value, flags=re.IGNORECASE)
+                current["Current Stock"] = parts[0].strip()
+                current["Threshold"] = parts[1].strip() if len(parts) > 1 else ""
+            else:
+                current["Current Stock"] = value
+        elif low.startswith("category:"):
+            current["Category"] = line.split(":", 1)[1].strip()
+        elif "locations:" in low:
+            current["Locations"] = line.split(":", 1)[1].strip()
+
+    if current:
+        rows.append(current)
+
+    return rows
 
 @app.route('/')
 def home():
@@ -1200,36 +1558,91 @@ def export_pdf():
 
     payload = request.json or {}
     lines = payload.get("lines", [])
-    title = payload.get("title", "Workorder Details Report")
+    query = payload.get("query", "")
+    title = _format_export_title(query)
 
     if not isinstance(lines, list) or not lines:
         return jsonify({"error": "No content to export."}), 400
 
+    workorder_rows = _extract_workorder_rows(lines)
+    permit_rows = _extract_permit_rows(lines)
+    location_rows = _extract_inventory_location_rows(lines)
+    low_stock_rows = _extract_low_stock_rows(lines)
+
     buffer = BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=A4)
-    page_w, page_h = A4
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=24,
+        rightMargin=24,
+        topMargin=24,
+        bottomMargin=24
+    )
+    styles = getSampleStyleSheet()
+    story = []
 
-    y = page_h - 40
-    left = 36
-    max_chars = 105
+    story.append(Paragraph(_clean_pdf_line(title), styles["Title"]))
+    story.append(Spacer(1, 10))
 
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(left, y, _clean_pdf_line(title))
-    y -= 20
+    if workorder_rows:
+        headers = ["Workorder ID", "Workorder Type", "Equipment ID", "Status", "Due Date", "Assigned To", "Full Name"]
+        rows = [[r.get(h, "") for h in headers] for r in workorder_rows]
+        col_widths = [74, 88, 74, 56, 66, 74, 80]
+    elif permit_rows:
+        headers = ["Permit Number", "Work Type", "Status", "Start Date", "End Date", "Location"]
+        rows = [[r.get(h, "") for h in headers] for r in permit_rows]
+        col_widths = [86, 90, 66, 78, 78, 100]
+    elif location_rows:
+        headers = ["Location Name", "Location ID", "Capacity", "Utilization %", "Available", "Racks"]
+        rows = [[r.get(h, "") for h in headers] for r in location_rows]
+        col_widths = [116, 96, 80, 72, 74, 58]
+    elif low_stock_rows:
+        headers = ["Product Name", "Product ID", "Severity", "Current Stock", "Threshold", "Category", "Locations"]
+        rows = [[r.get(h, "") for h in headers] for r in low_stock_rows]
+        col_widths = [86, 74, 70, 72, 72, 66, 96]
+    else:
+        inv_headers, inv_rows = _extract_numbered_records_table(lines)
+        if inv_headers and inv_rows:
+            headers = inv_headers
+            rows = inv_rows
+            available_width = A4[0] - 48
+            col_w = available_width / len(headers)
+            col_widths = [col_w] * len(headers)
+        else:
+            headers = ["Field", "Value"]
+            rows = _extract_field_value_rows(lines)
+            col_widths = [150, A4[0] - 48 - 150]
 
-    pdf.setFont("Helvetica", 10)
-    for raw in lines:
-        clean = _clean_pdf_line(raw)
-        wrapped = textwrap.wrap(clean, width=max_chars) or [""]
-        for part in wrapped:
-            if y < 40:
-                pdf.showPage()
-                y = page_h - 40
-                pdf.setFont("Helvetica", 10)
-            pdf.drawString(left, y, part)
-            y -= 14
+    # Use Paragraph cells for wrapping/alignment
+    body_style = styles["BodyText"]
+    body_style.fontSize = 8
+    body_style.leading = 10
+    body_style.wordWrap = "CJK"
+    header_style = styles["BodyText"]
+    header_style.fontSize = 9
+    header_style.leading = 11
 
-    pdf.save()
+    table_data = [[Paragraph(f"<b>{_clean_pdf_line(h)}</b>", header_style) for h in headers]]
+    for row in rows:
+        table_data.append([Paragraph(_clean_pdf_line(v), body_style) for v in row])
+
+    table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9F2F6")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#003A46")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F6FBFC")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(table)
+
+    doc.build(story)
     buffer.seek(0)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1442,28 +1855,41 @@ def chatbot_response():
 
         # Specific Permit Status Count
         count, status_title = get_specific_permit_status_count(user_input)
-        if count is not None:
-            return jsonify({"reply": [f"📊 There are **{count}** permit(s) in **{status_title}** status."]})
+        has_permit_range = (
+            re.search(r"\bfrom\s+\d{4}-\d{2}-\d{2}\s+to\s+\d{4}-\d{2}-\d{2}\b", user_input)
+            or re.search(r"\bfrom\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+to\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", user_input)
+        )
+        if count is not None and not has_permit_range:
+            return jsonify({"reply": [f"There are **{count}** permit(s) in **{status_title}** status."]})
 
         # Overall Permit Status Summary
         if any(phrase in user_input for phrase in [
-            "workpermit", "work permit", "permit status", 
+            "workpermit", "work permit", "permit status",
             "current workpermit", "current permit", "permit pending",
             "workpermit pending", "work permit pending"
         ]) and not re.search(r"\b(pw-\w+-\d+)\b", user_input, re.IGNORECASE):
             status_counts = get_permit_status_counts()
-            return jsonify({"reply": [
-                "📋 **Work Permit Status Summary:**",
-                "",
-                f"✅ Approved: {status_counts['approved']}",
-                f"🟡 Pending: {status_counts['pending']}",
-                f"🔵 In Progress: {status_counts['inprogress']}",
-                f"✅ Completed: {status_counts['completed']}",
-                f"⚠️ Overdue: {status_counts['overdue']}",
-                f"🟠 Extended: {status_counts['extended']}",
-                f"❌ Cancelled: {status_counts['cancelled']}",
-                f"🔴 Closed: {status_counts['closed']}"
-            ]})
+            return jsonify({
+                "reply": [
+                    "Work Permit Status Summary:",
+                    "",
+                    f"Approved: {status_counts['approved']}",
+                    f"Pending: {status_counts['pending']}",
+                    f"In Progress: {status_counts['inprogress']}",
+                    f"Completed: {status_counts['completed']}",
+                    f"Overdue: {status_counts['overdue']}",
+                    f"Extended: {status_counts['extended']}",
+                    f"Cancelled: {status_counts['cancelled']}",
+                    f"Closed: {status_counts['closed']}"
+                ],
+                "show_permit_filters": True
+            })
+
+        permit_status = extract_permit_status(user_input)
+        p_start, p_end, p_label = extract_date_range(user_input)
+        if "permit" in user_input and permit_status and p_start and p_end:
+            permits = get_permits_by_status_and_date(permit_status, p_start, p_end)
+            return jsonify({"reply": format_permit_filter_response(permits, permit_status, p_label)})
 
         # All pending permits today
         if "pending permits" in user_input and "today" in user_input:
