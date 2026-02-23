@@ -143,9 +143,15 @@ MAINTENANCE_BUTTONS = [
 ]
 
 MODULE_OVERVIEW_BUTTONS = [
-    {"text": "Safety", "action": "last alert"},
-    {"text": "CMMS", "action": "cmms help"},
-    {"text": "Inventory", "action": "inventory help"}
+    {"text": "Safety", "action": "module safety"},
+    {"text": "CMMS", "action": "module cmms"},
+    {"text": "Inventory", "action": "module inventory"}
+]
+
+SAFETY_BUTTONS = [
+    {"text": "Last alert", "action": "last alert"},
+    {"text": "Today's incidents", "action": "today incidents"},
+    {"text": "Hazard warnings", "action": "show hazard warnings"}
 ]
 
 # Emoji mapping
@@ -3041,45 +3047,65 @@ def chatbot_response():
             return jsonify({"reply": "✅ No alerts, incidents, or violations reported today."})    
 
     if is_about_app(user_input):
-        return jsonify({"reply": [
-            "🛡️ **OptiMES – Safety Management System**",
-            "It ensures industrial safety, compliance, and awareness across:",
-            "1️⃣ Hazard Warnings – Fire, smoke, gas leak incidents.",
-            "2️⃣ Worker Health & Safety – Slips, PPE violations, worker safety.",
-            "3️⃣ Compliance Policies – Occupancy control, unauthorized entry.",
-            "",
-            "💡 You can also ask about:",
-            "• 📦 **Inventory Management** - Products, stock, locations",
-            "• 🔧 **Maintenance (CMMS)** - Equipment, workorders, spare parts",
-            "• 📋 **Work Permits** - Status, approvals, worker details",
-            "• 📊 **Production & Energy** - Daily output, energy costs"
-        ]})
-    
+        return jsonify({
+            "reply": [
+                "OptiMES - Safety Management System",
+                "It ensures industrial safety, compliance, and awareness across modules.",
+                "",
+                "Please choose a module:"
+            ],
+            "buttons": MODULE_OVERVIEW_BUTTONS
+        })
+
+    if "module safety" in user_input:
+        return jsonify({
+            "reply": [
+                "Safety Module",
+                "",
+                "Choose a safety question below:"
+            ],
+            "buttons": SAFETY_BUTTONS
+        })
+
+    if "module cmms" in user_input:
+        return jsonify({
+            "reply": [
+                "Maintenance (CMMS) Module",
+                "",
+                "Choose a CMMS question below:"
+            ],
+            "buttons": MAINTENANCE_BUTTONS
+        })
+
+    if "module inventory" in user_input:
+        return jsonify({
+            "reply": [
+                "Inventory Module",
+                "",
+                "Choose an inventory question below:"
+            ],
+            "buttons": INVENTORY_BUTTONS
+        })
 
     if any(greet in user_input for greet in ["hi", "hello", "hey"]):
         return jsonify({
-            "reply": "👋 Hello! I'm your OptiMES assistant. I can help you with Safety, Inventory, Maintenance (CMMS), Work Permits, and Production data. How can I assist you today?",
-            "buttons": PRODUCTION_ENERGY_BUTTONS
+            "reply": "Hello! Please choose a module to continue:",
+            "buttons": MODULE_OVERVIEW_BUTTONS
         })
 
     if any(word in user_input for word in ["thank you", "thanks"]):
-        return jsonify({"reply": "😊 You're welcome!"})
+        return jsonify({"reply": "You are welcome!"})
 
     if any(word in user_input for word in ["help", "assist", "support"]):
         return jsonify({
             "reply": [
-                "🆘 **I can help you with:**",
+                "I can help you with Safety, CMMS, and Inventory.",
                 "",
-                "🔐 **Safety:** 'last alert', 'employee violations ADV001', 'today's incidents'",
-                "📦 **Inventory:** 'find product laptop', 'low stock', 'available locations'",
-                "🔧 **Maintenance (CMMS):** 'cmms help', 'workorder status', 'equipment under maintenance'",
-                "📋 **Work Permits:** 'permit status', 'pending permits', 'permit PW-2024-001'",
-                "📊 **Production:** 'production today', 'energy cost', 'lowest production shift'",
-                "",
-                "💡 Try any of the buttons below or ask a specific question!"
+                "Choose a module below."
             ],
-            "buttons": PRODUCTION_ENERGY_BUTTONS
+            "buttons": MODULE_OVERVIEW_BUTTONS
         })
+
     
     
      # Try to infer collections first
