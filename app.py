@@ -1,18 +1,28 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_file
 from pymongo import MongoClient, DESCENDING, ASCENDING
 from bson.objectid import ObjectId
 from datetime import datetime, timedelta, timezone
 from flask_cors import CORS
+from io import BytesIO
+import textwrap
 import os
 import re
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 app = Flask(__name__)
 CORS(app)
 
 # MongoDB Connection
-MONGO_URI = "mongodb+srv://adventistech2025:XOGhPBZxi0gDSPNO@cluster0.awnrusw.mongodb.net/OptiMES40"
+# MONGO_URI = "mongodb+srv://adventistech2025:XOGhPBZxi0gDSPNO@cluster0.awnrusw.mongodb.net/OptiMES40"
+MONGO_URI = "mongodb+srv://adventistech2025:XOGhPBZxi0gDSPNO@cluster0.awnrusw.mongodb.net/NewOptiMESX0"
 client = MongoClient(MONGO_URI)
-db = client["OptiMES40"]
+db = client["NewOptiMESX0"]
 permit_collection = db["permits"]
 
 # Scenario → Collections Map
@@ -44,6 +54,15 @@ MAINTENANCE_COLLECTIONS = {
     "workorders": db["workorders"],
     "workrequests": db["workrequests"],
     "spareparts": db["spareparts"]
+}
+
+WORKORDER_STATUS_ALIASES = {
+    "pending": ["pending"],
+    "in progress": ["in progress", "inprogress", "progress"],
+    "completed": ["completed", "finished"],
+    "closed": ["closed"],
+    "open": ["open"],
+    "assigned": ["assigned"]
 }
 
 # Maintenance Keywords - More specific to avoid confusion
@@ -89,10 +108,10 @@ PRODUCTION_ENERGY_BUTTONS = [
 
 # Inventory Query Buttons
 INVENTORY_BUTTONS = [
-    {"text": "Find product [name/ID]", "action": "Find product "},
+    {"text": "Find items [name/ID]", "action": "Find product "},
     {"text": "Show low stock products", "action": "Show low stock products"},
     {"text": "Show all suppliers", "action": "Show all suppliers"},
-    {"text": "Show all categories", "action": "Show all categories"},
+    # {"text": "Show all categories", "action": "Show all categories"},
     {"text": "What are the recent stock movements?", "action": "What are the recent stock movements?"},
     {"text": "What locations are available?", "action": "inventory what locations are available?"}
 ]
@@ -233,6 +252,200 @@ def get_completed_workorders():
         "status": {"$regex": "Completed", "$options": "i"}
     }).sort("duedate", DESCENDING).limit(10))
 
+def parse_any_date_value(value):
+    """Parse common date formats from workorder fields."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+
+    raw = value.strip()
+    if not raw:
+        return None
+
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%m-%d-%Y",
+        "%m/%d/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d-%m-%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+def extract_workorder_status(user_input):
+    """Extract canonical status from user query."""
+    for canonical, aliases in WORKORDER_STATUS_ALIASES.items():
+        for alias in aliases:
+            if re.search(r"\b" + re.escape(alias) + r"\b", user_input):
+                return canonical
+    return None
+
+def extract_dates_from_text(user_input):
+    tokens = []
+    patterns = [
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+    ]
+    for pattern in patterns:
+        for m in re.finditer(pattern, user_input):
+            token = m.group(0)
+            if token not in tokens:
+                tokens.append(token)
+    return tokens
+
+def extract_date_range(user_input):
+    """Return (start_datetime, end_datetime, label) from date/month expressions."""
+    today = datetime.now().date()
+
+    if "today" in user_input:
+        return (
+            datetime.combine(today, datetime.min.time()),
+            datetime.combine(today, datetime.max.time()),
+            "today"
+        )
+
+    if "yesterday" in user_input:
+        d = today - timedelta(days=1)
+        return (
+            datetime.combine(d, datetime.min.time()),
+            datetime.combine(d, datetime.max.time()),
+            "yesterday"
+        )
+
+    if "this month" in user_input:
+        start_day = today.replace(day=1)
+        if start_day.month == 12:
+            next_month = datetime(start_day.year + 1, 1, 1).date()
+        else:
+            next_month = datetime(start_day.year, start_day.month + 1, 1).date()
+        end_day = next_month - timedelta(days=1)
+        return (
+            datetime.combine(start_day, datetime.min.time()),
+            datetime.combine(end_day, datetime.max.time()),
+            start_day.strftime("%B %Y")
+        )
+
+    if "last month" in user_input:
+        first_this_month = today.replace(day=1)
+        end_day = first_this_month - timedelta(days=1)
+        start_day = end_day.replace(day=1)
+        return (
+            datetime.combine(start_day, datetime.min.time()),
+            datetime.combine(end_day, datetime.max.time()),
+            start_day.strftime("%B %Y")
+        )
+
+    numeric_month = re.search(r"\b(\d{4})-(0[1-9]|1[0-2])\b", user_input)
+    full_date = re.search(r"\b\d{4}-\d{2}-\d{2}\b", user_input)
+    if numeric_month and not full_date:
+        year = int(numeric_month.group(1))
+        month = int(numeric_month.group(2))
+        start_day = datetime(year, month, 1).date()
+        if month == 12:
+            next_month = datetime(year + 1, 1, 1).date()
+        else:
+            next_month = datetime(year, month + 1, 1).date()
+        end_day = next_month - timedelta(days=1)
+        return (
+            datetime.combine(start_day, datetime.min.time()),
+            datetime.combine(end_day, datetime.max.time()),
+            start_day.strftime("%B %Y")
+        )
+
+    month_map = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
+    }
+    month_year = re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})\b",
+        user_input,
+        re.IGNORECASE
+    )
+    if month_year:
+        month = month_map[month_year.group(1).lower()]
+        year = int(month_year.group(2))
+        start_day = datetime(year, month, 1).date()
+        if month == 12:
+            next_month = datetime(year + 1, 1, 1).date()
+        else:
+            next_month = datetime(year, month + 1, 1).date()
+        end_day = next_month - timedelta(days=1)
+        return (
+            datetime.combine(start_day, datetime.min.time()),
+            datetime.combine(end_day, datetime.max.time()),
+            start_day.strftime("%B %Y")
+        )
+
+    explicit_dates = extract_dates_from_text(user_input)
+    if len(explicit_dates) >= 2:
+        dt1 = parse_any_date_value(explicit_dates[0])
+        dt2 = parse_any_date_value(explicit_dates[1])
+        if dt1 and dt2:
+            start_day = min(dt1.date(), dt2.date())
+            end_day = max(dt1.date(), dt2.date())
+            return (
+                datetime.combine(start_day, datetime.min.time()),
+                datetime.combine(end_day, datetime.max.time()),
+                f"{start_day.isoformat()} to {end_day.isoformat()}"
+            )
+
+    if explicit_dates:
+        dt = parse_any_date_value(explicit_dates[0])
+        if dt:
+            d = dt.date()
+            return (
+                datetime.combine(d, datetime.min.time()),
+                datetime.combine(d, datetime.max.time()),
+                d.isoformat()
+            )
+    return None, None, None
+
+def get_workorders_by_status_and_date(status_key, start_date, end_date):
+    status_patterns = {
+        "pending": r"pending",
+        "in progress": r"in\s*progress",
+        "completed": r"completed",
+        "closed": r"closed",
+        "open": r"open",
+        "assigned": r"assigned"
+    }
+    pattern = status_patterns.get(status_key, re.escape(status_key))
+    rows = list(MAINTENANCE_COLLECTIONS["workorders"].find({
+        "status": {"$regex": pattern, "$options": "i"}
+    }))
+
+    out = []
+    for wo in rows:
+        candidate_dates = [wo.get("duedate"), wo.get("planningDate"), wo.get("date"), wo.get("createdAt")]
+        parsed = None
+        for c in candidate_dates:
+            parsed = parse_any_date_value(c)
+            if parsed:
+                break
+        if parsed:
+            parsed = parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+            if start_date <= parsed <= end_date:
+                out.append(wo)
+    out.sort(key=lambda x: str(x.get("duedate", "")))
+    return out
+
 def get_all_spareparts():
     """Get all spare parts"""
     return list(MAINTENANCE_COLLECTIONS["spareparts"].find().sort("sparepartsname", ASCENDING))
@@ -290,30 +503,24 @@ def format_maintenance_response(data, title):
         response = [f"🔧 **{title}** ({len(data)} items)"]
         for i, item in enumerate(data, 1):
             if isinstance(item, dict):
+                # For workorders/workrequests (normalize both shapes)
+                if any(k in item for k in ["workorderid", "workorderId", "workordertype", "workorderType"]):
+                    response.append(f"{i}. **Workorder ID:** {item.get('workorderid', item.get('workorderId', 'N/A'))}")
+                    response.append(f"   Workorder Type: {item.get('workordertype', item.get('workorderType', 'N/A'))}")
+                    response.append(f"   Equipment ID: {item.get('equipmentid', item.get('equipmentId', 'N/A'))}")
+                    response.append(f"   Status: {item.get('status', 'N/A')}")
+                    response.append(f"   Due Date: {item.get('duedate', item.get('planningDate', 'N/A'))}")
+                    response.append(f"   Assigned To: {item.get('assignedto', item.get('assignTo', 'N/A'))}")
+                    response.append(f"   Full Name: {item.get('fullname', 'N/A')}")
+
                 # For equipment
-                if "equipmentid" in item:
+                elif "equipmentid" in item:
                     response.append(f"{i}. **{item.get('equipmentname', 'N/A')}** (ID: {item.get('equipmentid', 'N/A')})")
                     response.append(f"   Status: {item.get('status', 'N/A')}")
                     response.append(f"   Department: {item.get('department', 'N/A')}")
                     response.append(f"   Location: {item.get('location', 'N/A')}")
                     if item.get('maintenancepriority'):
                         response.append(f"   Priority: {item.get('maintenancepriority')}")
-                    
-                # For workorders
-                elif "workorderid" in item:
-                    response.append(f"{i}. **{item.get('workorderid', 'N/A')}** - {item.get('workordertype', 'N/A')}")
-                    response.append(f"   Status: {item.get('status', 'N/A')}")
-                    response.append(f"   Priority: {item.get('priority', 'N/A')}")
-                    response.append(f"   Due Date: {item.get('duedate', 'N/A')}")
-                    response.append(f"   Assigned to: {item.get('fullname', 'N/A')}")
-                    
-                # For workrequests
-                elif "workorderId" in item:
-                    response.append(f"{i}. **{item.get('workorderId', 'N/A')}** - {item.get('workorderType', 'N/A')}")
-                    response.append(f"   Status: {item.get('status', 'N/A')}")
-                    response.append(f"   Priority: {item.get('priority', 'N/A')}")
-                    response.append(f"   Trade: {item.get('trade', 'N/A')}")
-                    response.append(f"   Location: {item.get('location', 'N/A')}")
                     
                 # For spare parts
                 elif "sparepartcode" in item:
@@ -372,9 +579,90 @@ def get_stock_by_product(product_id):
     return list(INVENTORY_COLLECTIONS["stocks"].find({"productId": product_id}))
 
 def get_low_stock_products():
-    """Get products with low stock"""
-    products = INVENTORY_COLLECTIONS["products"].find({"quantity": {"$lt": 10}})
-    return list(products)
+    """Get products with low stock - compare stocks collection quantity against product threshold"""
+    pipeline = [
+        # Step 1: Get all products with lowStockValue
+        {
+            "$project": {
+                "productId": 1,
+                "name": 1,
+                "category": 1,
+                "unit": 1,
+                "lowStockValue": 1,
+                "make": 1,
+                "partNumber": 1,
+                "description": 1
+            }
+        },
+        # Step 2: Lookup stocks for each product
+        {
+            "$lookup": {
+                "from": "stocks",
+                "localField": "productId",
+                "foreignField": "productId",
+                "as": "stockInfo"
+            }
+        },
+        # Step 3: Calculate actual quantity from stocks collection
+        {
+            "$addFields": {
+                "actualQuantity": {
+                    "$cond": {
+                        "if": {"$gt": [{"$size": "$stockInfo"}, 0]},
+                        "then": {"$sum": "$stockInfo.quantity"},
+                        "else": 0
+                    }
+                },
+                "threshold": {"$ifNull": ["$lowStockValue", 10]}
+            }
+        },
+        # Step 4: Filter only low stock items
+        {
+            "$match": {
+                "$expr": {
+                    "$lt": ["$actualQuantity", "$threshold"]
+                }
+            }
+        },
+        # Step 5: Sort by actual quantity (lowest first)
+        {"$sort": {"actualQuantity": 1}}
+    ]
+    
+    try:
+        results = list(INVENTORY_COLLECTIONS["products"].aggregate(pipeline))
+        # Update the quantity field with actual quantity from stocks
+        for product in results:
+            product["quantity"] = product.get("actualQuantity", 0)
+            product["lowStockValue"] = product.get("threshold", 10)
+        return results
+    except Exception as e:
+        print(f"Error in get_low_stock_products aggregation: {e}")
+        # Fallback: manually check each product
+        try:
+            low_stock_products = []
+            products = list(INVENTORY_COLLECTIONS["products"].find())
+            
+            for product in products:
+                product_id = product.get('productId')
+                threshold = product.get('lowStockValue', 10)
+                
+                # Get actual quantity from stocks collection
+                stocks = list(INVENTORY_COLLECTIONS["stocks"].find({"productId": product_id}))
+                actual_quantity = sum(stock.get('quantity', 0) for stock in stocks)
+                
+                # Check if below threshold
+                if actual_quantity < threshold:
+                    product["quantity"] = actual_quantity
+                    product["actualQuantity"] = actual_quantity
+                    product["threshold"] = threshold
+                    low_stock_products.append(product)
+            
+            # Sort by quantity (lowest first)
+            low_stock_products.sort(key=lambda x: x.get('actualQuantity', 0))
+            return low_stock_products
+        except Exception as fallback_error:
+            print(f"Error in fallback query: {fallback_error}")
+            return []
 
 def get_all_categories():
     """Get all inventory categories"""
@@ -422,25 +710,192 @@ def get_project_by_id(project_id):
     ]}
     return INVENTORY_COLLECTIONS["projects"].find_one(query)
 
-def get_recent_stock_movements(limit=10):
-    """Get recent stock movements/distributions"""
-    if "distributions" in INVENTORY_COLLECTIONS:
-        movements = list(INVENTORY_COLLECTIONS["distributions"].find()
-                        .sort("createdAt", DESCENDING)
-                        .limit(limit))
-    else:
-        movements = []
-        products = INVENTORY_COLLECTIONS["products"].find({"movements": {"$exists": True, "$ne": []}})
-        for product in products:
-            for movement in product.get("movements", [])[-5:]:
-                movement["productName"] = product.get("name", "Unknown")
-                movement["productId"] = product.get("productId", "Unknown")
-                movements.append(movement)
-        
-        movements.sort(key=lambda x: x.get("date", ""), reverse=True)
-        movements = movements[:limit]
+def get_recent_stock_movements(limit=10, days_back=7):
+    """Get recent stock movements by checking updatedAt timestamp
     
-    return movements
+    Args:
+        limit: Maximum number of movements to return (default: 10)
+        days_back: Number of days to look back for recent movements (default: 7)
+    """
+    try:
+        # Get today's date at start of day
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Calculate the date threshold (e.g., 7 days ago from now)
+        date_threshold = datetime.now() - timedelta(days=days_back)
+        
+        print(f"🔍 Today's date: {today}")
+        print(f"🔍 Looking for stock documents updated after: {date_threshold}")
+        
+        # First, try to get movements from TODAY only
+        today_pipeline = [
+            {
+                "$match": {
+                    "movements": {"$exists": True, "$ne": []},
+                    "updatedAt": {"$gte": today}
+                }
+            },
+            {"$sort": {"updatedAt": -1}},
+            {"$unwind": "$movements"},
+            {"$limit": limit},
+            {
+                "$lookup": {
+                    "from": "inventoryproducts",
+                    "localField": "productId",
+                    "foreignField": "productId",
+                    "as": "productInfo"
+                }
+            },
+            {
+                "$project": {
+                    "productId": 1,
+                    "productName": {"$arrayElemAt": ["$productInfo.name", 0]},
+                    "serialNo": 1,
+                    "unit": {"$ifNull": ["$movements.unit", "$unit"]},
+                    "type": "$movements.type",
+                    "quantity": "$movements.quantity",
+                    "fromLocation": "$movements.fromLocation",
+                    "toLocation": "$movements.toLocation",
+                    "toRack": "$movements.toRack",
+                    "toSubrack": "$movements.toSubrack",
+                    "toBox": "$movements.toBox",
+                    "purpose": "$movements.purpose",
+                    "conditionofproduct": "$movements.conditionofproduct",
+                    "date": "$movements.date",
+                    "prdate": "$movements.prdate",
+                    "podate": "$movements.podate",
+                    "prno": "$movements.prno",
+                    "pono": "$movements.pono",
+                    "invoice": "$movements.invoice",
+                    "invoicedate": "$movements.invoicedate",
+                    "reference": "$movements.reference",
+                    "notes": "$movements.notes",
+                    "createdAt": 1,
+                    "updatedAt": 1
+                }
+            }
+        ]
+        
+        results = list(INVENTORY_COLLECTIONS["stocks"].aggregate(today_pipeline))
+        print(f"✅ Found {len(results)} movements from TODAY")
+        
+        # If no results today, try last 7 days
+        if not results:
+            print(f"⚠️ No movements today, trying last {days_back} days...")
+            
+            week_pipeline = [
+                {
+                    "$match": {
+                        "movements": {"$exists": True, "$ne": []},
+                        "updatedAt": {"$gte": date_threshold}
+                    }
+                },
+                {"$sort": {"updatedAt": -1}},
+                {"$unwind": "$movements"},
+                {"$limit": limit},
+                {
+                    "$lookup": {
+                        "from": "inventoryproducts",
+                        "localField": "productId",
+                        "foreignField": "productId",
+                        "as": "productInfo"
+                    }
+                },
+                {
+                    "$project": {
+                        "productId": 1,
+                        "productName": {"$arrayElemAt": ["$productInfo.name", 0]},
+                        "serialNo": 1,
+                        "unit": {"$ifNull": ["$movements.unit", "$unit"]},
+                        "type": "$movements.type",
+                        "quantity": "$movements.quantity",
+                        "fromLocation": "$movements.fromLocation",
+                        "toLocation": "$movements.toLocation",
+                        "toRack": "$movements.toRack",
+                        "toSubrack": "$movements.toSubrack",
+                        "toBox": "$movements.toBox",
+                        "purpose": "$movements.purpose",
+                        "conditionofproduct": "$movements.conditionofproduct",
+                        "date": "$movements.date",
+                        "prdate": "$movements.prdate",
+                        "podate": "$movements.podate",
+                        "prno": "$movements.prno",
+                        "pono": "$movements.pono",
+                        "invoice": "$movements.invoice",
+                        "invoicedate": "$movements.invoicedate",
+                        "reference": "$movements.reference",
+                        "notes": "$movements.notes",
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            ]
+            
+            results = list(INVENTORY_COLLECTIONS["stocks"].aggregate(week_pipeline))
+            print(f"✅ Found {len(results)} movements from last {days_back} days")
+        
+        # If still no results, get the most recent ones regardless of date
+        if not results:
+            print(f"⚠️ No movements in last {days_back} days, getting most recent stocks...")
+            
+            fallback_pipeline = [
+                {
+                    "$match": {
+                        "movements": {"$exists": True, "$ne": []}
+                    }
+                },
+                {"$sort": {"updatedAt": -1}},
+                {"$limit": 5},  # Only get 5 most recent stock documents
+                {"$unwind": "$movements"},
+                {"$limit": limit},
+                {
+                    "$lookup": {
+                        "from": "inventoryproducts",
+                        "localField": "productId",
+                        "foreignField": "productId",
+                        "as": "productInfo"
+                    }
+                },
+                {
+                    "$project": {
+                        "productId": 1,
+                        "productName": {"$arrayElemAt": ["$productInfo.name", 0]},
+                        "serialNo": 1,
+                        "unit": {"$ifNull": ["$movements.unit", "$unit"]},
+                        "type": "$movements.type",
+                        "quantity": "$movements.quantity",
+                        "fromLocation": "$movements.fromLocation",
+                        "toLocation": "$movements.toLocation",
+                        "toRack": "$movements.toRack",
+                        "toSubrack": "$movements.toSubrack",
+                        "toBox": "$movements.toBox",
+                        "purpose": "$movements.purpose",
+                        "conditionofproduct": "$movements.conditionofproduct",
+                        "date": "$movements.date",
+                        "prdate": "$movements.prdate",
+                        "podate": "$movements.podate",
+                        "prno": "$movements.prno",
+                        "pono": "$movements.pono",
+                        "invoice": "$movements.invoice",
+                        "invoicedate": "$movements.invoicedate",
+                        "reference": "$movements.reference",
+                        "notes": "$movements.notes",
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            ]
+            
+            results = list(INVENTORY_COLLECTIONS["stocks"].aggregate(fallback_pipeline))
+            print(f"✅ Fallback found {len(results)} movements from most recent stocks")
+        
+        return results
+        
+    except Exception as e:
+        print(f"❌ Error in get_recent_stock_movements: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 def get_stock_movements_by_product(product_id):
     """Get stock movements for a specific product"""
@@ -728,9 +1183,62 @@ def get_permit_status_counts():
 
 # ==================== ROUTES ====================
 
+def _clean_pdf_line(text):
+    """Strip markdown-like markers for PDF readability."""
+    line = str(text) if text is not None else ""
+    line = line.replace("**", "")
+    return re.sub(r"\s+", " ", line).strip()
+
 @app.route('/')
 def home():
     return render_template("index.html")
+
+@app.route('/export-pdf', methods=['POST'])
+def export_pdf():
+    if not REPORTLAB_AVAILABLE:
+        return jsonify({"error": "PDF export unavailable. Install reportlab first."}), 500
+
+    payload = request.json or {}
+    lines = payload.get("lines", [])
+    title = payload.get("title", "Workorder Details Report")
+
+    if not isinstance(lines, list) or not lines:
+        return jsonify({"error": "No content to export."}), 400
+
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+
+    y = page_h - 40
+    left = 36
+    max_chars = 105
+
+    pdf.setFont("Helvetica-Bold", 13)
+    pdf.drawString(left, y, _clean_pdf_line(title))
+    y -= 20
+
+    pdf.setFont("Helvetica", 10)
+    for raw in lines:
+        clean = _clean_pdf_line(raw)
+        wrapped = textwrap.wrap(clean, width=max_chars) or [""]
+        for part in wrapped:
+            if y < 40:
+                pdf.showPage()
+                y = page_h - 40
+                pdf.setFont("Helvetica", 10)
+            pdf.drawString(left, y, part)
+            y -= 14
+
+    pdf.save()
+    buffer.seek(0)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return send_file(
+        buffer,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=f"workorder_details_{stamp}.pdf"
+    )
 
 @app.route('/chat', methods=['POST'])
 def chatbot_response():
@@ -1073,19 +1581,32 @@ def chatbot_response():
                 "workorder status summary", "how many workorders"
             ]):
                 status_counts = get_workorder_status_counts()
-                return jsonify({"reply": [
-                    "📊 **Workorder Status Summary:**",
-                    "",
-                    f"✅ Completed: {status_counts.get('completed', 0)}",
-                    f"🟡 In Progress: {status_counts.get('in progress', 0)}",
-                    f"🔵 Pending: {status_counts.get('pending', 0)}",
-                    f"🟠 Open: {status_counts.get('open', 0)}",
-                    f"🔴 Closed: {status_counts.get('closed', 0)}",
-                    f"👤 Assigned: {status_counts.get('assigned', 0)}",
-                    "",
-                    f"📈 **Total Workorders:** {sum(status_counts.values())}"
-                ]})
-            
+                return jsonify({
+                    "reply": [
+                        "Workorder Status Summary:",
+                        "",
+                        f"Completed: {status_counts.get('completed', 0)}",
+                        f"In Progress: {status_counts.get('in progress', 0)}",
+                        f"Pending: {status_counts.get('pending', 0)}",
+                        f"Open: {status_counts.get('open', 0)}",
+                        f"Closed: {status_counts.get('closed', 0)}",
+                        f"Assigned: {status_counts.get('assigned', 0)}",
+                        "",
+                        f"Total Workorders: {sum(status_counts.values())}"
+                    ],
+                    "show_workorder_filters": True
+                })
+
+            status_key = extract_workorder_status(user_input)
+            start_date, end_date, date_label = extract_date_range(user_input)
+            if "workorder" in user_input and status_key and start_date and end_date:
+                filtered_workorders = get_workorders_by_status_and_date(status_key, start_date, end_date)
+                status_title = status_key.title() if status_key != "in progress" else "In Progress"
+                if filtered_workorders:
+                    title = f"Workorders ({status_title}) for {date_label}"
+                    return jsonify({"reply": format_maintenance_response(filtered_workorders, title)})
+                return jsonify({"reply": [f"No {status_title} workorders found for {date_label}."]})
+
             # 3. Find workorder by ID
             workorder_match = re.search(r"\b(WO-[\w-]+|WR-[\w-]+)\b", user_input, re.IGNORECASE)
             if workorder_match or any(phrase in user_input for phrase in [
@@ -1456,26 +1977,63 @@ def chatbot_response():
         ]):
             movements = get_recent_stock_movements(limit=10)
             if movements:
-                response = ["📊 **Recent Stock Movements (Last 10):**"]
+                response = ["📊 **Recent Stock Movements (Last 10):**", ""]
                 for i, movement in enumerate(movements, 1):
-                    movement_type = movement.get('movementType', movement.get('type', 'Movement'))
-                    product_name = movement.get('productName', movement.get('product', 'Unknown'))
+                    movement_type = movement.get('type', 'Movement')
+                    product_name = movement.get('productName', 'Unknown')
                     product_id = movement.get('productId', 'N/A')
+                    serial_no = movement.get('serialNo', 'N/A')
                     
-                    response.append(f"{i}. **{movement_type}**")
-                    response.append(f"   Product: {product_name} ({product_id})")
-                    response.append(f"   Quantity: {movement.get('quantity', 0)}")
+                    response.append(f"{i}. **{movement_type}** - {product_name}")
+                    response.append(f"   📦 Product ID: {product_id} | Serial: {serial_no}")
+                    response.append(f"   📊 Quantity: {movement.get('quantity', 0)} {movement.get('unit', '')}")
                     
+                    # Show location details
                     if movement.get('fromLocation'):
-                        response.append(f"   From: {movement.get('fromLocation')}")
+                        response.append(f"   📤 From: {movement.get('fromLocation')}")
+                    
                     if movement.get('toLocation'):
-                        response.append(f"   To: {movement.get('toLocation')}")
+                        to_details = [movement.get('toLocation')]
+                        if movement.get('toRack'):
+                            to_details.append(f"Rack: {movement.get('toRack')}")
+                        if movement.get('toSubrack'):
+                            to_details.append(f"Subrack: {movement.get('toSubrack')}")
+                        if movement.get('toBox'):
+                            to_details.append(f"Box: {movement.get('toBox')}")
+                        response.append(f"   📥 To: {' → '.join(to_details)}")
+                    
+                    # Show dates
                     if movement.get('date'):
-                        response.append(f"   Date: {movement.get('date')}")
-                    if movement.get('reason'):
-                        response.append(f"   Reason: {movement.get('reason')}")
-                    if movement.get('issuedBy'):
-                        response.append(f"   Issued By: {movement.get('issuedBy')}")
+                        response.append(f"   📅 Date: {movement.get('date')}")
+                    
+                    # Show purchase order details
+                    if movement.get('prno'):
+                        response.append(f"   📋 PR No: {movement.get('prno')}")
+                        if movement.get('prdate'):
+                            response.append(f"      PR Date: {movement.get('prdate')}")
+                    
+                    if movement.get('pono'):
+                        response.append(f"   📋 PO No: {movement.get('pono')}")
+                        if movement.get('podate'):
+                            response.append(f"      PO Date: {movement.get('podate')}")
+                    
+                    if movement.get('invoice'):
+                        response.append(f"   📄 Invoice: {movement.get('invoice')}")
+                        if movement.get('invoicedate'):
+                            response.append(f"      Invoice Date: {movement.get('invoicedate')}")
+                    
+                    # Show purpose and condition
+                    if movement.get('purpose'):
+                        response.append(f"   🎯 Purpose: {movement.get('purpose')}")
+                    
+                    if movement.get('conditionofproduct'):
+                        response.append(f"   🔧 Condition: {movement.get('conditionofproduct')}")
+                    
+                    if movement.get('reference'):
+                        response.append(f"   🔗 Reference: {movement.get('reference')}")
+                    
+                    if movement.get('notes'):
+                        response.append(f"   📝 Notes: {movement.get('notes')}")
                     
                     response.append("")
                 
@@ -1613,12 +2171,48 @@ def chatbot_response():
         if any(phrase in user_input for phrase in ["low stock", "low inventory", "running out", "need to order"]):
             low_stock = get_low_stock_products()
             if low_stock:
-                response = ["⚠️ **Low Stock Products (below threshold):**"]
+                response = ["⚠️ **Low Stock Products (below threshold):**", ""]
                 for product in low_stock:
-                    response.append(f"• **{product.get('name', 'N/A')}** (ID: {product.get('productId', 'N/A')})")
-                    response.append(f"  Quantity: {product.get('quantity', 0)} / Threshold: {product.get('lowStockValue', 'N/A')}")
-                    response.append(f"  Category: {product.get('category', 'N/A')}")
+                    product_id = product.get('productId', 'N/A')
+                    current_qty = product.get('quantity', 0)
+                    threshold = product.get('lowStockValue', product.get('threshold', 10))
+                    unit = product.get('unit', '')
+                    
+                    # Determine status icon
+                    if current_qty == 0:
+                        status_icon = "🔴"
+                        status_text = "OUT OF STOCK"
+                    elif current_qty < threshold * 0.5:
+                        status_icon = "🔴"
+                        status_text = "CRITICALLY LOW"
+                    else:
+                        status_icon = "🟡"
+                        status_text = "LOW STOCK"
+                    
+                    response.append(f"{status_icon} **{product.get('name', 'N/A')}** (ID: {product_id}) - {status_text}")
+                    response.append(f"   Current Stock: **{current_qty} {unit}** / Threshold: {threshold} {unit}")
+                    response.append(f"   Category: {product.get('category', 'N/A')}")
+                    
+                    # Show stock locations if available
+                    if current_qty > 0:
+                        stocks = list(INVENTORY_COLLECTIONS["stocks"].find({"productId": product_id}))
+                        if stocks:
+                            locations = []
+                            for s in stocks:
+                                if s.get('quantity', 0) > 0:
+                                    loc_id = s.get('locationId', 'Unknown')
+                                    loc_qty = s.get('quantity', 0)
+                                    locations.append(f"{loc_id} ({loc_qty} {unit})")
+                            if locations:
+                                response.append(f"   📍 Locations: {', '.join(locations[:3])}")
+                                if len(locations) > 3:
+                                    response.append(f"      ... and {len(locations) - 3} more location(s)")
+                    else:
+                        response.append(f"   ⚠️ **OUT OF STOCK - REORDER IMMEDIATELY!**")
+                    
                     response.append("")
+                
+                response.append(f"📊 **Total Low Stock Items:** {len(low_stock)}")
                 return jsonify({"reply": response})
             else:
                 return jsonify({"reply": ["✅ All products are above low stock threshold"]})
